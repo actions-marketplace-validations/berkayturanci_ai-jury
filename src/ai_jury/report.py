@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import classification as _classification
+from . import panel as panel_mod
 from .adapters import AgentResult
 from .findings import SEVERITY_ORDER, Finding, flatten_inline
 
@@ -98,6 +99,13 @@ def _metadata_block(metadata: dict) -> list[str]:
         # name/reason can never break the table or forge structure if a future
         # source carries agent/diff text.
         lines.append(f"- rounds decision: {flatten_inline(stop_reason)}")
+    routing_meta = metadata.get("routing") or {}
+    if routing_meta.get("mode") == "tiered":
+        # Tiered routing (#714): the cost decision is part of the run record.
+        line = f"- routing: tiered — {flatten_inline(routing_meta.get('reason', ''))}"
+        if routing_meta.get("escalated"):
+            line += f"; escalated: {flatten_inline(routing_meta.get('escalation_reason', ''))}"
+        lines.append(line)
     lines.append(f"- verify: {'on' if metadata['verify_enabled'] else 'off'}")
     lines.append(f"- context mode: {metadata['context_mode']}")
     # Partial-result signals (issue #30): only rendered when relevant so a
@@ -124,12 +132,53 @@ def _metadata_block(metadata: dict) -> list[str]:
             f"{panel.get('configured', 0)} reviewer(s)** "
             f"({panel.get('abstained', 0)} returned no review, "
             f"{panel.get('failed', 0)} failed) — "
-            f"{panel.get('vendors', 0)} vendor(s) contributed. An abstention is not "
+            f"{panel.get('vendors', 0)} vendor(s) contributed "
+            "(counted by vendor identity; the table below shows each seat's "
+            "configured vendor). An abstention is not "
             "an approval; treat cross-vendor consensus accordingly."
+        )
+    # What a downstream consumer will actually be handed, and the chair's role in
+    # it (#699). Stated on every run, not only a short one: the number that got a
+    # tier-3 review refused was produced by a panel nothing had flagged as short.
+    # Presence, not truth: an all-silent panel supplies 0 reviews, and 0 is
+    # falsy, so a truthiness guard deleted the line in the one run where a
+    # reader most needs the number — while the run's own log still announced the
+    # seats it had. Zero is a count, and it is printed as one.
+    if panel.get("reviews_supplied") is not None:
+        chair_name = panel.get("chair") or ""
+        if panel.get("chair_ballot"):
+            role = f"chair `{chair_name}` also sat on the panel — its review is one of them"
+        elif chair_name:
+            role = f"chair `{chair_name}` supplied no review of its own — synthesis only"
+        else:  # pragma: no cover - a run always resolves a chair
+            role = "no chair was resolved"
+        # The four ways a seat that ran supplies no review, named separately —
+        # they ask for different fixes, and a single "N did not review" would
+        # send a reader to the CLI logs for a reviewer that answered fine and
+        # simply reviewed nothing (#700, round 2). The phrases come from
+        # `panel.CAUSE_PHRASES`, the same table the shortfall message renders
+        # from, so this line and that one describe the same seat the same way;
+        # writing them apart is how "named nothing checkable and abstained" came
+        # to be printed over a ballot that had named a file and then refused
+        # (#700, round 5).
+        missing = [
+            f"{panel[panel_mod.PANEL_METADATA_KEYS[cause]]} {panel_mod.CAUSE_PHRASES[cause]}"
+            for cause in panel_mod.ABSTENTION_CAUSES
+            if panel.get(panel_mod.PANEL_METADATA_KEYS[cause])
+        ]
+        tail = f"; {', '.join(missing)}" if missing else ""
+        lines.append(
+            f"- reviews for a downstream consumer: {panel['reviews_supplied']} of "
+            f"{panel.get('ballots', 0)} ballot(s) (a ballot counts only when it names "
+            f"what it read and votes; the chair's synthesis record is carried alongside "
+            f"them and is not a review); {role}{tail}"
         )
     total = metadata["total_wall_clock_s"]
     lines.append(f"- total wall-clock (cost proxy, not $): {total:.0f}s")
     lines.append("")
+    # The `vendor` column is PROVENANCE: the string the operator configured,
+    # verbatim, even when the gate counts the seat as `cli` (#701). The count in
+    # the short-panel line above is the gate's arithmetic, and says so.
     lines.append("| agent | vendor | status | duration |")
     lines.append("| --- | --- | --- | --- |")
     for a in metadata["agents"]:

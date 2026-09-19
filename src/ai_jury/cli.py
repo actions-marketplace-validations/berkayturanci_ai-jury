@@ -20,11 +20,19 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, panel
 from . import doctor as doctor_module
-from .ci import evaluate_ci
+from .adapters import EFFORT_LEVELS, effort_warnings, make_adapter
+from .ci import evaluate_ci, fail_on_error
 from .classification import classify, label_strings
-from .config import ConfigError, load_config, load_raw_config, validate_config
+from .config import (
+    DEFAULT_MIN_VENDORS,
+    ConfigError,
+    bound_error,
+    load_config,
+    load_raw_config,
+    validate_config,
+)
 from .github import (
     apply_labels,
     issue_body,
@@ -34,7 +42,7 @@ from .github import (
     pr_context,
     pr_diff,
 )
-from .metadata import build_run_metadata, panel_accounting
+from .metadata import build_run_metadata, collapse_reason, distinct_vendors
 from .orchestrator import review_diff, run_jury
 from .policy import PolicyError, load_policy
 from .redaction import redact
@@ -137,17 +145,43 @@ def _read_diff(args) -> tuple[str, str]:
             with Path(args.diff_file).open("rb") as fh:
                 return _read_capped(fh, args.diff_file), ""
         except (OSError, UnicodeDecodeError) as exc:
-            raise SystemExit(f"error reading diff file '{args.diff_file}': {exc}") from None
+            raise SystemExit(
+                f"error reading diff file '{args.diff_file}': {redact(str(exc))[0]}"
+            ) from None
     raise SystemExit(
         "error: provide one of --pr, --issue, --diff-file, --commit, --commits "
         "(or --diff-file - for stdin)"
     )
 
 
+def resolve_min_vendors(cli_value, config) -> tuple[int, bool]:
+    """The effective cross-vendor threshold, and whether a person asked for it.
+
+    PURE. ``cli_value`` is ``args.min_vendors``: ``None`` when neither
+    ``--min-vendors`` nor ``--no-min-vendors`` was passed, in which case the
+    value comes from ``[jury.ci] min_vendors`` (shipped as 2, #682).
+
+    The second element says whether the threshold was named on the command line.
+    Only an unnamed (default) threshold is scoped down to runs that actually
+    claimed cross-vendor consensus — someone who types ``--min-vendors 3`` on a
+    two-vendor panel is asking for the failure and gets it.
+    """
+    if cli_value is None:
+        return max(0, int(getattr(config.ci, "min_vendors", DEFAULT_MIN_VENDORS))), False
+    return max(0, int(cli_value)), True
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jury",
         description="Cross-vendor multi-agent PR review jury.",
+        # The subcommands are argv-intercepts (handled before this parser runs),
+        # so argparse cannot list them on its own — and until #661 nothing in
+        # `--help` mentioned that they exist at all.
+        epilog=(
+            "Subcommands (each takes its own --help): init, config, comment, "
+            "apply, replay, run-agent, cache clear, examples, guide."
+        ),
     )
     src = p.add_argument_group("input")
     src.add_argument("--pr", help="GitHub PR number/URL to review (uses `gh`)")
@@ -292,12 +326,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-vendors",
         type=int,
-        default=0,
+        default=None,
         metavar="N",
         help=(
             "fail (exit 3) unless at least N distinct vendors contributed a "
-            "review; 0 disables. --strict checks availability at startup, this "
+            "review; 0 disables. Default from config ([jury.ci] min_vendors, "
+            "shipped as 2). --strict checks availability at startup, this "
             "checks participation at the end"
+        ),
+    )
+    p.add_argument(
+        "--no-min-vendors",
+        dest="min_vendors",
+        action="store_const",
+        const=0,
+        help=(
+            "opt out of the cross-vendor guard: accept a run whose panel "
+            "collapsed to a single vendor (same as --min-vendors 0)"
+        ),
+    )
+    p.add_argument(
+        "--min-reviews",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "require at least N reviews for a downstream consumer (a panel ballot "
+            "that names what it read and votes; neither the chair's synthesis "
+            "record nor an abstaining ballot is one); 0 disables. Checked before "
+            "the panel runs and again on the result (exit 3). "
+            "Default from config ([jury.ci] min_reviews, shipped as 0)"
         ),
     )
     p.add_argument(
@@ -319,8 +377,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="print a local readiness diagnostics report and exit (no telemetry is collected or sent)",
     )
     p.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "with --doctor, print the machine-readable provider export "
+            "(schema ai-jury.doctor.v1) as the only thing on stdout"
+        ),
+    )
+    p.add_argument(
         "--write",
         help="with --doctor, also write the diagnostics as JSON to this path (secrets redacted)",
+    )
+    p.add_argument(
+        "--effort",
+        choices=list(EFFORT_LEVELS),
+        default=None,
+        help=(
+            "reasoning effort for every agent this run (overrides [[agent]] effort); "
+            "ignored with a warning for agents whose vendor has no effort control"
+        ),
     )
     p.add_argument("-o", "--output", help="write the report to a file instead of stdout")
     p.add_argument(
@@ -330,9 +405,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--format",
-        choices=["markdown", "json", "sarif"],
+        choices=["markdown", "json", "sarif", "keel-reviews"],
         default="markdown",
-        help="output format for stdout/--output (default: markdown)",
+        help="output format for stdout/--output (default: markdown); "
+        "'keel-reviews' emits one review record per panelist plus the chair",
     )
     p.add_argument(
         "--decision",
@@ -493,8 +569,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--hints",
+        dest="hints",
         action="store_true",
+        default=None,
         help="run local static analysis pre-pass (Ruff/ESLint) to inject hints (issue #523)",
+    )
+    p.add_argument(
+        "--no-hints",
+        dest="hints",
+        action="store_false",
+        help="skip the static analysis pre-pass even if jury.toml enables it",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
@@ -546,7 +630,9 @@ def _run_apply(rest: list[str]) -> int:
                 return 2
             content = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            print(f"Error reading report file '{ns.report}': {exc}", file=sys.stderr)
+            print(
+                f"Error reading report file '{ns.report}': {redact(str(exc))[0]}", file=sys.stderr
+            )
             return 2
     elif sys.stdin is not None and not sys.stdin.isatty():
         content = sys.stdin.read()
@@ -696,7 +782,6 @@ _AGENT_BLURB = {
 
 def _init_available() -> dict:
     """Map each known agent name to whether it is reachable right now."""
-    from .adapters import make_adapter
     from .config import AgentSpec
     from .scaffold import KNOWN_AGENTS, agent_templates
 
@@ -764,12 +849,19 @@ def _init_interactive(available: dict, input_fn=input, local_endpoint=None, mode
             )
             local_model = input_fn("Local model name [qwen2.5-coder:7b]: ").strip() or None
 
+    # Reasoning effort (issue #662). Skippable: Enter leaves it unset, so
+    # nothing is written and every agent keeps its vendor default. Asked last so
+    # the established question order is unchanged.
+    effort_raw = input_fn("Reasoning effort — low/medium/high [skip]: ").strip().lower()
+    effort = effort_raw if effort_raw in EFFORT_LEVELS else None
+
     return {
         "agents": agents,
         "rounds": rounds,
         "chair": chair,
         "verify": verify,
         "local_model": local_model,
+        "effort": effort,
     }
 
 
@@ -1120,9 +1212,12 @@ def _render_effective_config(cfg) -> str:
     lines.append("agents:")
     for a in cfg.agents:
         flag = "" if a.enabled else "  (disabled)"
-        target = a.endpoint if a.vendor == "local" else (a.command or "—")
+        target = a.endpoint if a.adapter_key == "local" else (a.command or "—")
         model = f" model={a.model}" if a.model else ""
-        lines.append(f"  - {a.name} ({a.vendor}) → {target}{model}{flag}")
+        # The adapter is shown only when it is not the vendor's own (#705), so
+        # this line keeps its shape for every configuration that predates the key.
+        via = f" via {a.adapter_key}" if a.adapter_key != a.vendor else ""
+        lines.append(f"  - {a.name} ({a.vendor}{via}) → {target}{model}{flag}")
     return "\n".join(lines)
 
 
@@ -1148,6 +1243,521 @@ def _run_config(rest: list[str]) -> int:
     print(f"source: {source}")
     print(_render_effective_config(cfg))
     return 0
+
+
+# Cap on a prompt file. An orchestrator's prompt is a few KB of instructions
+# plus, at most, a diff; this only bounds memory against a pathological file.
+_MAX_PROMPT_BYTES = 8 * 1024 * 1024
+
+
+def _read_prompt(path: str) -> tuple[str, str | None]:
+    """Read a prompt file (or stdin for ``-``). Returns ``(text, error)``."""
+    if path == "-":
+        stream = sys.stdin.buffer if sys.stdin is not None else None
+        if stream is None:
+            return "", "cannot read the prompt from stdin: stdin is not available"
+        raw = stream.read(_MAX_PROMPT_BYTES + 1)
+    else:
+        target = Path(path)
+        if not target.is_file():
+            return "", f"prompt file not found: {path}"
+        try:
+            raw = target.read_bytes()[: _MAX_PROMPT_BYTES + 1]
+        except OSError as exc:
+            return "", f"could not read prompt file '{path}': {redact(str(exc))[0]}"
+    if len(raw) > _MAX_PROMPT_BYTES:
+        return "", f"prompt exceeds the {_MAX_PROMPT_BYTES}-byte limit"
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        return "", "empty prompt — nothing to send to the agent"
+    return text, None
+
+
+def _run_agent_parser() -> argparse.ArgumentParser:
+    """The ``jury run-agent`` flag surface (built separately so it can be tested)."""
+    from . import runagent
+
+    sub = argparse.ArgumentParser(
+        prog="jury run-agent",
+        description="Run ONE configured agent for one role and print a JSON "
+        "result with attribution. The integration point for an orchestrator "
+        "(keel's `keel delegate run`) or a CI script that needs a single "
+        "agent rather than the whole panel.",
+    )
+    sub.add_argument(
+        "--agent",
+        help="agent to run: a [[agent]] name from jury.toml, or a built-in "
+        f"vendor ({', '.join(runagent.BUILTIN_AGENTS)}); append ':<model>' to "
+        "override the model (e.g. codex:gpt-5.2)",
+    )
+    sub.add_argument(
+        "--role",
+        help="what the agent is being asked to do: "
+        f"{'|'.join(runagent.ROLES)}. "
+        f"{'/'.join(runagent.READ_ONLY_ROLES)} always run read-only; "
+        f"{'/'.join(sorted(runagent.WRITE_ROLES))} need --allow-write",
+    )
+    sub.add_argument("--prompt-file", help="path to the prompt to send, or '-' for stdin")
+    sub.add_argument("--cwd", help="directory to run the agent in (default: the current one)")
+    sub.add_argument(
+        "--timeout",
+        type=int,
+        help="seconds before the AGENT is killed (default: the agent's configured "
+        "timeout). This bounds the agent, never the wait — see --wait-timeout",
+    )
+    sub.add_argument(
+        "--effort",
+        choices=list(EFFORT_LEVELS),
+        help="reasoning effort for vendors that support one (see `jury --doctor --json`)",
+    )
+    sub.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="grant the vendor's write/tool mode; required by the implement and "
+        "fix roles, ignored by the read-only ones",
+    )
+    sub.add_argument(
+        "--format",
+        choices=["json", "text"],
+        default="json",
+        help="json: the full result document (default); text: only the agent's text",
+    )
+    sub.add_argument(
+        "--detach",
+        action="store_true",
+        help="start the run in the background and print its run id immediately",
+    )
+    sub.add_argument(
+        "--run-id",
+        help="id for a detached run: letters, digits, '.', '_' or '-', max 64 "
+        "characters (default: a random one). Only meaningful with --detach",
+    )
+    sub.add_argument("--wait", metavar="RUN_ID", help="block until a detached run finishes")
+    sub.add_argument(
+        "--wait-timeout",
+        type=int,
+        metavar="SECONDS",
+        help="seconds --wait will block before giving up (default: the run's own "
+        f"timeout + {runagent.WAIT_GRACE_S}s, else {runagent.DEFAULT_WAIT_TIMEOUT_S}s)",
+    )
+    sub.add_argument("--status", action="store_true", help="list detached runs and exit")
+    sub.add_argument("--config", help="path to jury.toml (default: ./jury.toml or built-in)")
+    sub.add_argument(
+        "--cache-dir",
+        help="where detached-run state lives (default: $JURY_CACHE_DIR or ~/.cache/ai-jury)",
+    )
+    sub.add_argument(
+        "--mock", action="store_true", help="run the offline mock adapter instead of a real agent"
+    )
+    # The detached child re-enters this same command; the flag only tells it to
+    # record its result in the run's state file. Hidden: it is not a surface
+    # anyone should call directly.
+    sub.add_argument("--_child", dest="child", action="store_true", help=argparse.SUPPRESS)
+    return sub
+
+
+def _child_argv(ns, run_id: str, python: str) -> list[str]:
+    """The argv of the background child a ``--detach`` run spawns (pure)."""
+    argv = [
+        python,
+        "-m",
+        "ai_jury",
+        "run-agent",
+        "--agent",
+        ns.agent,
+        "--role",
+        ns.role,
+        "--prompt-file",
+        str(Path(ns.prompt_file).resolve()),
+        "--run-id",
+        run_id,
+        "--_child",
+    ]
+    if ns.cwd:
+        argv += ["--cwd", str(Path(ns.cwd).resolve())]
+    if ns.timeout is not None:
+        argv += ["--timeout", str(ns.timeout)]
+    if ns.effort:
+        argv += ["--effort", ns.effort]
+    if ns.allow_write:
+        argv.append("--allow-write")
+    if ns.config:
+        argv += ["--config", str(Path(ns.config).resolve())]
+    if ns.cache_dir:
+        argv += ["--cache-dir", str(Path(ns.cache_dir).resolve())]
+    if ns.mock:
+        argv.append("--mock")
+    return argv
+
+
+def _run_run_agent(rest: list[str], spawn=None, sleep=None, clock=None) -> int:
+    """Handle ``jury run-agent`` (issue #661): one agent, one role, one JSON result.
+
+    Exit codes: ``0`` the agent ran and produced output, ``1`` it ran and
+    failed (the JSON says why — same fail-soft vocabulary as a panel run),
+    ``2`` the request itself was refused (bad role, missing write grant,
+    unknown agent, unreadable prompt).
+    """
+    import dataclasses
+    import time
+
+    from . import runagent
+    from .adapters import effort_args, make_adapter
+
+    ns = _run_agent_parser().parse_args(rest)
+
+    # Validate every id the caller supplies BEFORE it can reach a path. The
+    # library refuses an unsafe one on its own (runagent.run_path), so this is
+    # about the error the operator sees, not about whether the write is safe.
+    for flag, value in (("--run-id", ns.run_id), ("--wait", ns.wait)):
+        if value is not None:
+            problem = runagent.check_run_id(value)
+            if problem:
+                print(f"error: {flag}: {problem}", file=sys.stderr)
+                return 2
+    if ns.run_id and not (ns.detach or ns.child):
+        # It named nothing and recorded nothing — silently ignoring it would let
+        # a script believe it had a handle it could later --wait on.
+        print(
+            "error: --run-id only applies to a detached run; add --detach, or "
+            "drop --run-id to run in the foreground",
+            file=sys.stderr,
+        )
+        return 2
+
+    if ns.status:
+        print(json.dumps({"runs": runagent.list_runs(ns.cache_dir)}, indent=2))
+        return 0
+
+    if ns.wait:
+        if ns.wait_timeout is not None and ns.wait_timeout <= 0:
+            print("error: --wait-timeout must be a positive number of seconds", file=sys.stderr)
+            return 2
+        # `--detach` reserves the id by writing the state file BEFORE it returns,
+        # so a run with no state file was never started — a typo, or the wrong
+        # --cache-dir. Say so now instead of blocking until a deadline expires.
+        known = runagent.read_state(ns.wait, ns.cache_dir)
+        if known is None:
+            print(f"error: no such run '{ns.wait}'", file=sys.stderr)
+            return 2
+        # The deadline comes from what the run was actually given (its own
+        # timeout plus head-room to write its state file), so a long agent run
+        # is not cut short and a dead one is not waited on forever.
+        deadline = ns.wait_timeout
+        if deadline is None:
+            deadline = runagent.default_wait_timeout(known)
+        # When liveness cannot be determined, a run that has already died can
+        # only be noticed when the deadline expires. Say so once, so a long
+        # silence reads as a known limitation rather than a hung command. The
+        # opening is cause-neutral and the reason names which case it is —
+        # "this platform cannot probe" is false on POSIX for a run that simply
+        # has not been claimed yet. The deadline always applies regardless, so
+        # the wait is bounded either way.
+        unknown = runagent.liveness_unknown_reason(known)
+        if unknown:
+            print(
+                f"warning: cannot tell whether run '{ns.wait}' is still alive — "
+                f"{unknown}; waiting up to {deadline:g}s for it to report",
+                file=sys.stderr,
+            )
+        state, timed_out = runagent.wait_for_run(
+            ns.wait,
+            cache_dir=ns.cache_dir,
+            timeout=deadline,
+            sleep=sleep or time.sleep,
+            clock=clock or time.monotonic,
+        )
+        if timed_out:
+            print(
+                f"error: run '{ns.wait}' did not finish within {deadline:g}s",
+                file=sys.stderr,
+            )
+            return 2
+        if state is None:
+            # The file vanished while we waited (a `jury cache clear`, a manual
+            # rm). Distinguished from "never existed", which returned above.
+            print(f"error: run '{ns.wait}' disappeared while waiting", file=sys.stderr)
+            return 2
+        if state.get("status") == runagent.STATUS_LOST:
+            # Returned as soon as the pid was seen gone, not at the deadline:
+            # there is no result coming, and blocking for one is just delay.
+            print(
+                f"error: run '{ns.wait}' was lost — its process is gone and it "
+                f"never recorded a result (see {runagent.output_path(ns.wait, ns.cache_dir)})",
+                file=sys.stderr,
+            )
+        print(json.dumps(state, indent=2))
+        return 0 if state.get("ok") else 1
+
+    missing = [
+        flag
+        for flag, value in (
+            ("--agent", ns.agent),
+            ("--role", ns.role),
+            ("--prompt-file", ns.prompt_file),
+        )
+        if not value
+    ]
+    if missing:
+        print(
+            f"error: {', '.join(missing)} required (or use --wait <run-id> / --status)",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Role policy first: an implement run without --allow-write must be refused
+    # before a prompt is read, a config is loaded, or a child is spawned.
+    policy = runagent.role_policy(ns.role, ns.allow_write)
+    if policy.refusal:
+        print(f"error: {policy.refusal}", file=sys.stderr)
+        return 2
+    if policy.warning:
+        print(f"warning: {policy.warning}", file=sys.stderr)
+
+    if ns.cwd and not Path(ns.cwd).is_dir():
+        print(f"error: --cwd is not a directory: {ns.cwd}", file=sys.stderr)
+        return 2
+
+    try:
+        config = load_config(ns.config)
+    except (ConfigError, FileNotFoundError) as exc:
+        print(redact(f"error: {exc}")[0], file=sys.stderr)
+        return 2
+
+    spec, error = runagent.resolve_agent(config, ns.agent)
+    if error is not None:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    if ns.timeout is not None:
+        if ns.timeout <= 0:
+            print("error: --timeout must be a positive number of seconds", file=sys.stderr)
+            return 2
+        spec = dataclasses.replace(spec, timeout=ns.timeout)
+    if ns.effort:
+        spec = dataclasses.replace(spec, effort=ns.effort)
+        warning = effort_args(spec.adapter_key, ns.effort, spec.model).warning
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
+
+    if ns.detach:
+        return _detach_run_agent(ns, spec, policy, spawn=spawn)
+
+    prompt, error = _read_prompt(ns.prompt_file)
+    if error is not None:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    # `run-agent` loads its config without validation (it drives ONE named seat,
+    # so an unrelated seat's mistake must not stop it), which is why the adapter
+    # name is checked here, where it is used, rather than only at load (#708).
+    try:
+        adapter = make_adapter(spec, mock=ns.mock)
+    except ConfigError as exc:
+        print(redact(f"error: {exc}")[0], file=sys.stderr)
+        return 2
+    print(
+        f"run-agent: {spec.name} ({spec.vendor}) role={policy.role} "
+        f"{'write' if policy.write else 'read-only'}",
+        file=sys.stderr,
+    )
+    started = time.time()
+    record = _child_recorder(ns, spec, policy, started) if ns.child and ns.run_id else None
+    if record is not None:
+        # Claim the run with our OWN pid before doing any work. Every write to
+        # this state file now comes from this process, in order, so nothing can
+        # overwrite the terminal document the way the parent's post-spawn write
+        # used to. Until this lands the run has no pid, which reads as
+        # "liveness unknown" — reported as running, never as lost.
+        record(runagent.initial_state(ns.run_id, spec, policy.role, started), terminal=False)
+    try:
+        if ns.cwd:
+            with contextlib.chdir(ns.cwd):
+                result = adapter.run(prompt, phase=policy.role, role_policy=policy)
+        else:
+            result = adapter.run(prompt, phase=policy.role, role_policy=policy)
+        # The second (and last) place a seat is invoked, so it records the id it
+        # sent exactly as the orchestrator's does (#709).
+        result.model = adapter.resolved_model()
+        document = runagent.result_dict(spec, policy.role, result)
+    except BaseException as exc:
+        # A detached child that dies without writing leaves its run at
+        # "running" forever, and a `--wait` on it can only time out. Adapters
+        # are fail-soft, so reaching here means something unexpected — a
+        # KeyboardInterrupt, a bug — and the run must still end in a terminal
+        # state that says so. Re-raised: this records the death, it does not
+        # swallow it.
+        if record is not None:
+            record(_crash_document(spec, policy.role, started, exc))
+        raise
+
+    if record is not None:
+        record(document)
+    if ns.format == "text":
+        print(document["text"])
+    else:
+        print(json.dumps(document, indent=2))
+    return 0 if document["ok"] else 1
+
+
+def _crash_document(spec, role: str, started: float, exc: BaseException) -> dict:
+    """A result document for a child that died before producing one (#661)."""
+    import time
+
+    from . import runagent
+    from .adapters import ERR_UNKNOWN, AgentResult
+
+    reason = f"{type(exc).__name__}: {redact(str(exc))[0]}"
+    return runagent.result_dict(
+        spec,
+        role,
+        AgentResult(
+            spec.name,
+            spec.vendor,
+            False,
+            "",
+            max(0.0, time.time() - started),
+            f"run-agent exited before the agent finished: {reason}",
+            error_code=ERR_UNKNOWN,
+        ),
+    )
+
+
+def _child_recorder(ns, spec, policy, started: float):
+    """A callable that writes a detached child's state file (issue #661).
+
+    Called twice: once at the top with ``terminal=False`` to claim the run with
+    this process's pid, and once at the end — from the success path or the
+    crash handler — with the result document. Both writes come from the child,
+    which is what keeps them ordered: the parent writes only before the spawn,
+    so no stale copy can land on top of the finished document.
+
+    Fail-soft: a child that cannot write its state must still print its
+    document to the log, since the log is then the only record.
+    """
+    from . import runagent
+
+    del spec, policy
+
+    def record(document: dict, terminal: bool = True) -> None:
+        state = dict(document)
+        state.update(
+            {
+                "run_id": ns.run_id,
+                "status": runagent.STATUS_DONE if terminal else runagent.STATUS_RUNNING,
+                # `started_at` travels with the pid so a reader can see how old
+                # the claim is — see runagent.pid_alive on why a pid alone is
+                # not proof of identity.
+                "started_at": started,
+                "pid": os.getpid(),
+            }
+        )
+        try:
+            runagent.write_state(ns.run_id, state, ns.cache_dir)
+        except (OSError, ValueError) as exc:
+            print(f"warning: could not record run state: {redact(str(exc))[0]}", file=sys.stderr)
+
+    return record
+
+
+def _detach_run_agent(ns, spec, policy, spawn=None) -> int:
+    """Start a ``run-agent`` call in the background and print its run id."""
+    import time
+
+    from . import runagent
+
+    if ns.prompt_file == "-":
+        print(
+            "error: --detach needs a prompt FILE; the background run has no stdin to read from",
+            file=sys.stderr,
+        )
+        return 2
+    if not Path(ns.prompt_file).is_file():
+        print(f"error: prompt file not found: {ns.prompt_file}", file=sys.stderr)
+        return 2
+
+    # An operator-supplied id was already validated at parse time, and a
+    # generated one is valid by construction — `runagent.run_path` refuses an
+    # unsafe id regardless, so there is nothing left to re-check here.
+    run_id = ns.run_id or runagent.new_run_id()
+    if runagent.state_path(run_id, ns.cache_dir).exists():
+        print(
+            f"error: run '{run_id}' already exists; choose another --run-id",
+            file=sys.stderr,
+        )
+        return 2
+
+    state = runagent.initial_state(run_id, spec, policy.role, time.time())
+    try:
+        # Reserve the id BEFORE spawning, so a duplicate is refused rather than
+        # discovered by two children racing for the same state file.
+        runagent.write_state(run_id, state, ns.cache_dir)
+        out_path = runagent.output_path(run_id, ns.cache_dir)
+        argv = _child_argv(ns, run_id, sys.executable)
+        launch = spawn or _spawn_detached
+        pid = launch(argv, out_path)
+    except (OSError, ValueError) as exc:
+        print(f"error: could not start the detached run: {redact(str(exc))[0]}", file=sys.stderr)
+        return 2
+
+    # The parent writes the state file EXACTLY ONCE, before the spawn. It used
+    # to write a second time afterwards to record the pid, from the stale dict
+    # it still held — and a child that finished during launch had its terminal
+    # document overwritten with `status: running`, losing the answer entirely.
+    # The child records its own pid instead (see `_child_running_state`), so
+    # every write after this one comes from the child, in order.
+    print(
+        json.dumps(
+            {
+                # The pid is the parent's own knowledge, reported for the
+                # operator's benefit; it is deliberately NOT written to the
+                # state file from here.
+                **runagent.run_summary(state),
+                "pid": pid if isinstance(pid, int) else None,
+                "state_file": str(runagent.state_path(run_id, ns.cache_dir)),
+                "output_file": str(runagent.output_path(run_id, ns.cache_dir)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+#: Deliberately-unreaped background children (see :func:`_spawn_detached`). The
+#: parent is a short-lived CLI invocation, so this holds at most one entry per
+#: `--detach` in a process that is about to exit.
+_DETACHED_CHILDREN: list = []
+
+
+def _spawn_detached(argv: list[str], out_path: Path) -> int:
+    """Start the background child, streaming its stdout+stderr to ``out_path``.
+
+    Its own session, so the child outlives the shell that launched it — the
+    whole point of ``--detach`` for an orchestrator that dispatches work and
+    comes back for it later. Returns the child's pid, which the caller records
+    so ``--status`` can later tell a live run from an abandoned one.
+    """
+    import subprocess
+
+    kwargs: dict = {}
+    if hasattr(os, "setsid"):
+        kwargs["start_new_session"] = True
+    # 0600 like the state file: the log holds the agent's full output, which is
+    # derived from the prompt and is no less sensitive than the diff a review sees.
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        proc = subprocess.Popen(  # noqa: S603 - argv is built here, never shell-parsed
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            **kwargs,
+        )
+    # Not waiting for this child is the whole point, but a dropped Popen warns
+    # ("subprocess N is still running") when it is collected, and the parent
+    # exits moments later so there is nothing to reap. Hold the reference
+    # instead of lying about the return code or reaching into private state.
+    _DETACHED_CHILDREN.append(proc)
+    return proc.pid
 
 
 def _run_replay(rest: list[str]) -> int:
@@ -1263,6 +1873,48 @@ _PROGRESS_PREFIXES = (
 def _is_progress_milestone(msg: str) -> bool:
     """Whether a log line is a coarse milestone worth a sticky-comment update."""
     return msg.startswith(_PROGRESS_PREFIXES)
+
+
+#: Every CLI flag that writes a `[jury]` setting `validate_config` puts a bound
+#: on, as `(flag, argparse dest, setting)` (issue #748). The settings are keys
+#: of `config._NUMERIC_BOUNDS`, so the rule and the message are the config
+#: path's own; only the `where` differs, naming the flag the operator typed
+#: rather than a key they may never have written.
+#:
+#: The flags NOT here were checked against the same table and belong nowhere
+#: else: `--seed` has no bound to break (a malformed `[jury] seed` is read as
+#: "no seed" on purpose, not as an error); `--min-vendors` / `--min-reviews`
+#: are clamped to >= 0 on both surfaces by `_non_negative_int`, which is
+#: deliberately fail-safe rather than fatal; `--chunk`, `--early-stop`,
+#: `--verify`, `--redact`, `--auto` and `--hints` are booleans; `--effort`,
+#: `--decision`, `--context-mode` and `--format` are argparse `choices`, which
+#: already refuse a value outside the vocabulary; and `--fail-on` has shared its
+#: rule with the validator since #718.
+_BOUNDED_FLAGS = (
+    ("--rounds", "rounds", "rounds"),
+    ("--max-rounds", "max_rounds", "max_rounds"),
+    ("--total-timeout", "total_timeout", "total_timeout"),
+    ("--phase-timeout", "phase_timeout", "phase_timeout"),
+    ("--retries", "retries", "retries"),
+    ("--max-diff-bytes", "max_diff_bytes", "diff.max_bytes"),
+)
+
+
+def _override_bound_error(args) -> str | None:
+    """The first CLI override breaking a bound ``validate_config`` enforces.
+
+    ``None`` is "the flag was not passed" and leaves the config value — which
+    the validator has already checked — standing; it is never a value to range
+    check, so an unset flag can never be mistaken for a zero.
+    """
+    for flag, dest, setting in _BOUNDED_FLAGS:
+        value = getattr(args, dest, None)
+        if value is None:
+            continue
+        message = bound_error(setting, value, where=flag)
+        if message:
+            return message
+    return None
 
 
 def _maybe_add_local_fallback(config, args, log) -> None:
@@ -1451,6 +2103,12 @@ def main(argv: list[str] | None = None) -> int:
     if raw[:1] == ["apply"]:
         return _run_apply(raw[1:])
 
+    # Single-agent role dispatch (issue #661): `jury run-agent` runs ONE agent
+    # for one role and prints a JSON result with attribution — the integration
+    # point for an orchestrator. Intercepted like the other subcommands.
+    if raw[:1] == ["run-agent"]:
+        return _run_run_agent(raw[1:])
+
     # Theater replay (issue #449): `jury replay <outcome.json>` re-drives the
     # deliberation scene from a saved outcome — no agents, no network.
     # Intercepted before the main parser like the other subcommands.
@@ -1458,6 +2116,26 @@ def main(argv: list[str] | None = None) -> int:
         return _run_replay(raw[1:])
 
     args = build_parser().parse_args(argv)
+
+    # Checked before any short-circuiting branch below, so `--json` is rejected
+    # wherever it is misplaced rather than only on the paths that reach the end.
+    if args.json and not args.doctor:
+        print(
+            "error: --json applies to --doctor; use --format json for the review report.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Same vocabulary check `validate_config` applies to `[jury.ci] fail_on`,
+    # reported with the same message (issue #718). Checked here, beside the
+    # other flag guards, so a misspelled gate is refused before an agent is
+    # paid for — and refused even without `--ci`, where the flag is inert:
+    # otherwise the typo surfaces only on the run it was supposed to gate.
+    if args.fail_on:
+        message = fail_on_error(args.fail_on.split(","), "--fail-on")
+        if message:
+            print(f"error: {message}", file=sys.stderr)
+            return 2
 
     if args.clear_cache:
         from .cache import Cache
@@ -1467,8 +2145,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.doctor:
-        diagnostics = doctor_module.build_diagnostics(args.config)
-        print(doctor_module.render_report(diagnostics))
+        # Model discovery costs a probe per agent and only the JSON export
+        # renders it; the human report must not pay for a field it never prints.
+        diagnostics = doctor_module.build_diagnostics(args.config, probe_models=args.json)
+        if args.json:
+            # Exactly ONE JSON document on stdout, and nothing else: the export
+            # is meant to be piped straight into `jq` / an orchestrator, so any
+            # human chatter (including the --write confirmation below) goes to
+            # stderr.
+            print(json.dumps(doctor_module.doctor_report_dict(diagnostics), indent=2))
+        else:
+            print(doctor_module.render_report(diagnostics))
         if args.write:
             try:
                 Path(args.write).write_text(
@@ -1477,7 +2164,8 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as exc:
                 print(f"error: {redact(str(exc))[0]}", file=sys.stderr)
                 return 2
-            print(f"\nWrote diagnostics to {args.write}")
+            stream = sys.stderr if args.json else sys.stdout
+            print(f"\nWrote diagnostics to {args.write}", file=stream)
         return 0
 
     if args.config_validate:
@@ -1501,6 +2189,21 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"Config invalid: {redact(str(exc))[0]}", file=sys.stderr)
         return 2
+    # One value, one field, one answer, whichever surface it was written on
+    # (issue #748). The overrides below are assigned straight onto the config
+    # AFTER `validate_config` has run, so until now nothing range-checked them:
+    # `--rounds 0` was accepted, ran a full Round 1 and exited 0 while `rounds =
+    # 0` in `jury.toml` was a hard error, on a flag `docs/parameters.md`
+    # documents as `≥ 1`. An operator who wrote `--rounds 0` meaning "no
+    # debate" got a complete review round, a report, and nothing anywhere
+    # saying the number they passed had been ignored.
+    #
+    # Refused here — before the diff is read and long before an agent is paid
+    # for — with exit 2, like every other bad-input exit on this path.
+    override_error = _override_bound_error(args)
+    if override_error:
+        print(f"error: {override_error}", file=sys.stderr)
+        return 2
     if args.rounds is not None:
         config.rounds = args.rounds
         # A fixed --rounds is a hard override: it disables adaptive early-stop so
@@ -1516,11 +2219,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase_timeout is not None:
         config.phase_timeout = args.phase_timeout
     if args.retries is not None:
-        config.retries = max(0, args.retries)
+        # Assigned as written: the `max(0, …)` clamp that used to stand here was
+        # the second rule for one value (#748). It silently turned `--retries
+        # -1` into 0 while `retries = -1` in `jury.toml` was a hard error, and
+        # is unreachable now that the same bound refuses the flag above.
+        config.retries = args.retries
     if args.seed is not None:
         config.seed = args.seed
     if args.chair:
         config.chair = args.chair
+    # Applied to the config (rather than resolved late like --min-vendors)
+    # because the pre-run half of this gate lives in the orchestrator: it has to
+    # be able to refuse a bench that is too small BEFORE the panel is paid for.
+    if args.min_reviews is not None:
+        config.ci.min_reviews = max(0, args.min_reviews)
+    # --effort is a whole-panel override: it wins over every [[agent]] effort so
+    # one flag raises (or lowers) the depth of the entire run.
+    if args.effort is not None:
+        for agent in config.agents:
+            agent.effort = args.effort
+    # Warn ONCE per run per distinct message, before any agent is invoked, for
+    # every panelist whose vendor cannot act on the requested effort. Real
+    # adapters are passed only outside --mock, so an offline demo never spawns a
+    # vendor CLI to check a model listing.
+    for warning in effort_warnings(
+        config.enabled_agents, adapter_factory=None if args.mock else make_adapter
+    ):
+        print(f"warning: {warning}", file=sys.stderr)
     if args.verify is not None:
         config.verify = args.verify
     if args.context_mode is not None:
@@ -1638,20 +2363,50 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "tiered", False):
         config.routing = "tiered"
-    if getattr(args, "hints", False):
-        config.hints = True
+    if config.routing == "tiered" and getattr(args, "min_vendors", None) is not None:
+        # The routed panel keeps at least the vendor floor the gate will apply
+        # (#714); a `--min-vendors` override has to reach the plan, not only the
+        # gate that runs after the panel has been paid for.
+        config.ci.min_vendors = max(0, int(args.min_vendors))
+    # ``--hints`` / ``--no-hints`` override ``[jury] hints`` in BOTH directions;
+    # the sentinel (None) means "not passed", so the config value stands (#715).
+    hints_override = getattr(args, "hints", None)
+    if hints_override is not None:
+        config.hints = hints_override
 
+    # The pre-pass block is carried SEPARATELY from the user context (#715).
+    # Appending it to ``context`` here made it invisible under the default
+    # context mode: ``run_jury`` clears ``context`` when the mode is "diff-only",
+    # so the linters ran, this line was logged, and the panel saw nothing. The
+    # orchestrator joins the block into the Round 1 prompt after that filter.
+    #
+    # The linters see the CHANGED files and nothing else (#737). The paths come
+    # from the same plan ``review_diff`` builds below — ``plan_for`` is pure, so
+    # the ``kept`` list here is the one the panel is shown — which means a file
+    # dropped by ``[jury.diff] include/exclude`` never contributes a hint about a
+    # diff the reviewers cannot read. ``--issue`` reviews prose and has no
+    # changed paths at all, so it gets no block. When the change touches nothing
+    # Ruff or ESLint handles, ``collect_static_hints`` returns "" rather than
+    # falling back to the working tree.
+    hints_block = ""
     if config.hints:
         from .hints import collect_static_hints
+        from .orchestrator import plan_for
 
-        sh = collect_static_hints()
+        changed_paths = [] if args.issue else [p for p in plan_for(config, diff).kept_paths if p]
+        sh = collect_static_hints(changed_paths)
         if sh:
-            context = (context + "\n\n" + sh) if context else sh
-            log("injected static analysis hints into review context")
+            hints_block = sh
+            log(f"injected static analysis hints for {len(changed_paths)} changed file(s)")
 
     # Optional local result cache (issue #33): a hit skips the run entirely; a
     # miss runs the jury and stores the outcome. The key covers the diff,
-    # effective config, prompt version, package version, context policy, and seed.
+    # effective config, prompt version, package version, context policy, the
+    # context text that policy admits (#738), the static-analysis block the
+    # linters produced (#745), and seed. ``context`` is passed straight through from
+    # ``_read_diff`` and ``hints_block`` is the string resolved just above — both
+    # are the ones ``run_jury`` gets, so the key is a function of what the panel
+    # is shown and not of a second reading of the config.
     cache = None
     cache_k = None
     outcome = None
@@ -1660,7 +2415,13 @@ def main(argv: list[str] | None = None) -> int:
 
         cache = Cache(args.cache_dir)
         cache_k = cache_key(
-            config, diff, mock=args.mock, policy=policy, mode=("issue" if args.issue else "code")
+            config,
+            diff,
+            context=context,
+            hints=hints_block,
+            mock=args.mock,
+            policy=policy,
+            mode=("issue" if args.issue else "code"),
         )
         outcome = cache.load(cache_k)
         if outcome is not None:
@@ -1752,6 +2513,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     diff,
                     context=context,
+                    hints=hints_block,
                     mock=args.mock,
                     strict=args.strict,
                     policy=policy,
@@ -1764,6 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     diff,
                     context=context,
+                    hints=hints_block,
                     mock=args.mock,
                     strict=args.strict,
                     policy=policy,
@@ -1813,16 +2576,27 @@ def main(argv: list[str] | None = None) -> int:
             court.set_vote(vote)
         court.close()
 
-    metadata = build_run_metadata(outcome, config, decision=decision, vote=vote)
+    # Ballot vocabulary follows the review mode, exactly as the vote tally does:
+    # an issue review votes on completeness (READY/UNCLEAR/NEEDS_INFO), not on a
+    # diff's correctness. Resolved BEFORE the metadata, which now derives the
+    # ballots to count them (#700, round 2) and must derive the same ones the
+    # report renders.
+    ballot_mode = "issue" if args.issue else "code"
+
+    metadata = build_run_metadata(outcome, config, decision=decision, vote=vote, mode=ballot_mode)
 
     if args.format == "json":
         from .formats import to_json
 
-        report = to_json(outcome, config, decision=decision, vote=vote)
+        report = to_json(outcome, config, decision=decision, vote=vote, mode=ballot_mode)
     elif args.format == "sarif":
         from .formats import to_sarif
 
         report = to_sarif(outcome, config)
+    elif args.format == "keel-reviews":
+        from .formats import to_keel_reviews
+
+        report = to_keel_reviews(outcome, config, vote=vote, mode=ballot_mode)
     else:
         # Output mode (issue: full transcript). --verbose => summary + transcript;
         # --transcript (or [jury] transcript, unless --no-transcript) => the
@@ -1868,28 +2642,59 @@ def main(argv: list[str] | None = None) -> int:
     if args.metadata_json:
         with Path(args.metadata_json).open("w", encoding="utf-8") as fh:
             fh.write(json.dumps(metadata, indent=2) + "\n")
-        log(f"metadata written to {args.metadata_json}")
+        log(f"metadata written to {redact(args.metadata_json)[0]}")
 
     ci_exit = 0
     # A run whose panel collapsed is a different thing wearing the same output
-    # (#625). `--strict` fails when a configured CLI is *missing*; this fails
-    # when one was present, probed fine, and returned nothing — which is how a
-    # three-vendor panel silently becomes one. Opt-in, so the default is
-    # unchanged, and exit 3 so it is distinguishable from a findings failure.
-    if getattr(args, "min_vendors", 0) > 0:
-        contributed = panel_accounting(outcome.reviews).get("vendors", 0)
-        if contributed < args.min_vendors:
-            log(
-                f"panel collapsed: {contributed} vendor(s) contributed a review, "
-                f"--min-vendors {args.min_vendors} required. An abstention is not "
-                "an approval; cross-vendor consensus was not formed."
-            )
-            ci_exit = 3
+    # (#625/#682). `--strict` fails when a configured CLI is *missing*; this
+    # fails when one was present, probed fine, and returned nothing — which is
+    # how a three-vendor panel silently becomes one. It FAILS CLOSED by default
+    # (`[jury.ci] min_vendors`, shipped as 2) and is scoped to runs that claimed
+    # cross-vendor consensus, so a single-vendor install is untouched; exit 3, so
+    # it is distinguishable from a findings failure.
+    required, explicit = resolve_min_vendors(getattr(args, "min_vendors", None), config)
+    collapsed = collapse_reason(
+        outcome.reviews,
+        required,
+        None if explicit else distinct_vendors(config.enabled_agents),
+    )
+    if collapsed:
+        log(collapsed)
+        ci_exit = 3
+    # The other half of the #699 gate. The orchestrator refuses a bench that is
+    # too small before spending it; this catches the two cases a pre-flight
+    # cannot predict — an agent that was present, ran, and returned nothing, and
+    # one that answered with prose naming nothing a reader could check. Both are
+    # recorded as abstentions and neither is a review, so the number the consumer
+    # will accept can fall below its minimum while every seat "answered" (#700,
+    # round 2: `--min-reviews 3` used to be satisfied by three "Looks good to me"
+    # replies). Exit 3, the same family as a collapsed panel: the panel, not the
+    # findings, is what fell short. Evaluated on cached outcomes too, which is
+    # why `min_reviews` is kept out of the cache key.
+    panel_meta = metadata.get("panel") or {}
+    short_panel = panel.shortfall(
+        panel_meta.get("reviews_supplied") or 0,
+        config.ci.min_reviews,
+        stage="after the panel ran",
+        # Every cause the metadata publishes, passed by the one mapping that
+        # names them: a call site listing two of the four printed the other two
+        # under a cause their own ballots contradicted (#700, round 5).
+        **{key: panel_meta.get(key) or 0 for key in panel.PANEL_METADATA_KEYS.values()},
+    )
+    if short_panel:
+        log(short_panel)
+        ci_exit = 3
     if args.ci:
         fail_on = config.ci.fail_on
         if args.fail_on:
             fail_on = [s.strip().lower() for s in args.fail_on.split(",") if s.strip()]
-        ci_exit, ci_reason = evaluate_ci(outcome.groups, fail_on, config.ci.ignore_unverified)
+        gate_exit, ci_reason = evaluate_ci(outcome.groups, fail_on, config.ci.ignore_unverified)
+        # A collapsed panel outranks the severity gate: `evaluate_ci` reports on
+        # findings the panel did or did not raise, and a panel that never formed
+        # is not evidence either way. Before #682 this assignment overwrote the
+        # collapse exit, so `--ci --min-vendors 2` reported a clean pass on a
+        # single-vendor run — the exact failure the flag was added for.
+        ci_exit = ci_exit or gate_exit
         # Only the markdown report carries the human-readable CI gate section;
         # json/sarif documents stay machine-clean. The exit code is unchanged.
         if args.format == "markdown":
@@ -1906,7 +2711,7 @@ def main(argv: list[str] | None = None) -> int:
             log("no verified findings with a suggested fix — no patches emitted")
         elif args.patches_out:
             Path(args.patches_out).write_text(patches_section, encoding="utf-8")
-            log(f"suggested patches written to {args.patches_out}")
+            log(f"suggested patches written to {redact(args.patches_out)[0]}")
         elif args.format == "markdown":
             report += "\n\n" + patches_section.rstrip()
         else:
@@ -1918,9 +2723,39 @@ def main(argv: list[str] | None = None) -> int:
         log(f"progress comment finalized on PR #{args.pr}")
 
     if args.output:
-        with Path(args.output).open("w", encoding="utf-8") as fh:
-            fh.write(report + "\n")
-        log(f"report written to {args.output}")
+        # By the time this write runs the panel has been invoked, the debate is
+        # over and the verdict is rendered: the run is paid for. An unwritable
+        # path used to come out of `open()` as a raw `FileNotFoundError`
+        # traceback (issue #749) — an implementation detail where a sentence
+        # naming the path belongs, and one that took the report with it, because
+        # `-o` is exactly what suppresses the stdout copy below.
+        #
+        # So it is reported the way the `--doctor --write` failure a few hundred
+        # lines up is (named path, redacted reason, exit 2), and the report falls
+        # back to STDOUT rather than to another file. A fallback file would put
+        # the run somewhere the operator never named — a second surprise on top
+        # of the first, able to clobber, and no more likely to succeed when the
+        # cause is a full or read-only filesystem — while stdout is where this
+        # exact document would have gone had `-o` not been passed at all. It is
+        # redirectable and greppable, so the run survives; exit 2 keeps a caller
+        # from reading the delivery as a success.
+        try:
+            with Path(args.output).open("w", encoding="utf-8") as fh:
+                fh.write(report + "\n")
+        except OSError as exc:
+            print(
+                f"error: could not write the report to "
+                f"'{redact(args.output)[0]}': {redact(str(exc))[0]}",
+                file=sys.stderr,
+            )
+            print(
+                "error: the review is complete and is printed on stdout instead; "
+                "redirect it to keep the report.",
+                file=sys.stderr,
+            )
+            print(report)
+            return 2
+        log(f"report written to {redact(args.output)[0]}")
     elif not (live_streamed and args.format == "markdown"):
         # In --live markdown mode the step stream WAS the stdout output; don't also
         # dump the consolidated report (it would duplicate everything just shown).

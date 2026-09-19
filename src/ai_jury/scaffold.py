@@ -124,6 +124,13 @@ def agents_needing_remote_opt_in() -> tuple[str, ...]:
 #:
 #: ``agent_templates`` reads only module constants, so this costs no I/O at
 #: import and is deterministic.
+#:
+#: Read by ``cli._init_available``, ``cli._init_interactive``, ``cli._init_wizard``
+#: and ``cli._run_init`` — every path through which ``jury init`` offers, detects
+#: or defaults an agent. Nothing in *this* module reads it, which is the whole of
+#: what CodeQL's intra-module ``py/unused-global-variable`` sees (#696): the
+#: readers are real, and deleting this tuple would take ``--list-agents``, the
+#: wizard and ``--preset all`` with it.
 KNOWN_AGENTS: tuple[str, ...] = tuple(agent_templates())
 
 # Substrings that hint a local model is code-oriented (preferred for reviews).
@@ -171,6 +178,7 @@ def build_config(
     context_mode: str | None = None,
     redact_secrets: bool | None = None,
     ci_fail_on: list[str] | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Build a jury config dict from selected agent names.
 
@@ -182,6 +190,10 @@ def build_config(
     ``ci_fail_on`` knobs (used by ``jury init --wizard``) are written ONLY when
     not ``None`` — callers that omit them produce byte-identical output to before,
     keeping the scaffolded file free of redundant built-in defaults.
+
+    ``effort`` (issue #662) is written onto each selected agent whose vendor can
+    act on it; agents whose vendor has no effort control are left alone rather
+    than scaffolded with a setting that would only warn at run time.
     """
     templates = agent_templates()
     chosen: list[dict] = []
@@ -193,11 +205,18 @@ def build_config(
         if tmpl is None:
             raise ValueError(f"unknown agent '{name}'; choose from {', '.join(templates.keys())}")
         entry = dict(tmpl)
+        # EXEMPT from `normalise_vendor` (issue #701, round 3): `entry` is a copy
+        # of one of this module's OWN templates, whose vendor strings are literals
+        # written here in normalised form. There is no operator spelling to
+        # normalise — the value is not yet configuration, it is what this function
+        # is about to write out as configuration.
         if entry.get("vendor") == "local":
             if local_model:
                 entry["model"] = local_model
             if local_endpoint:
                 entry["endpoint"] = local_endpoint
+        if effort and _effort_supported(entry.get("vendor", "")):
+            entry["effort"] = effort
         chosen.append(entry)
         seen.add(name)
 
@@ -226,6 +245,17 @@ def build_config(
     return {"jury": jury, "agent": chosen}
 
 
+def _effort_supported(vendor: str) -> bool:
+    """Whether *vendor* has an effort control (see ``adapters.effort_args``).
+
+    Imported lazily so this module keeps its light import graph; ``adapters``
+    is the single owner of the vendor -> effort mapping.
+    """
+    from .adapters import effort_supported
+
+    return effort_supported(vendor)
+
+
 def _scalar(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -244,7 +274,31 @@ def _render_value(value) -> str:
 
 
 # Stable key order for agent tables so output is deterministic and readable.
-_AGENT_KEY_ORDER = ("name", "vendor", "command", "endpoint", "model", "extra_args")
+_AGENT_KEY_ORDER = ("name", "vendor", "command", "endpoint", "model", "effort", "extra_args")
+
+#: Commented hint written under every effort-capable agent that has no explicit
+#: level, so the setting is discoverable from the generated file itself.
+_EFFORT_HINT = '# effort = "medium"    # low | medium | high'
+
+
+#: Written under every scaffolded ``[jury.ci]`` (issue #682). Commented out,
+#: because the shipped default already IS 2 — the hint exists so a reader
+#: discovers the knob and its opt-out here rather than only after a run exits 3.
+#:
+#: The section it lives under is emitted UNCONDITIONALLY (issue #692). It used to
+#: be written only when a caller passed ``ci_fail_on``, which no preset and no
+#: plain ``jury init`` ever does — so the hint the module defines never reached a
+#: generated file, and `--preset thorough` (three or four vendors, and therefore
+#: the config most likely to exit 3 on a one-CLI machine) shipped with nothing
+#: about the guard in it at all.
+_MIN_VENDORS_HINT = (
+    "# Distinct vendors that must have contributed a review before the run can",
+    "# stand as cross-vendor consensus (exit 3 otherwise). Defaults to 2 and only",
+    "# applies when 2+ vendors are enabled HERE — including when one of their CLIs",
+    "# is not installed; set 0 (or pass --no-min-vendors) to accept a panel that",
+    "# collapsed to one vendor, or --strict to fail at startup on a missing CLI.",
+    "# min_vendors = 2",
+)
 
 
 def render_toml(config: dict) -> str:
@@ -276,11 +330,16 @@ def render_toml(config: dict) -> str:
             if key in context:
                 lines.append(f"{key} = {_render_value(context[key])}")
         lines.append("")
-    ci = jury.get("ci")
-    if ci and "fail_on" in ci:
-        lines.append("[jury.ci]")
+    # `[jury.ci]` is always written, with the cross-vendor hint under it (#692).
+    # `fail_on` still appears only when a caller chose one, so the file keeps
+    # stating no redundant defaults; an otherwise empty section is comments only
+    # and parses to `{}`, which is exactly what the run resolves today.
+    ci = jury.get("ci") or {}
+    lines.append("[jury.ci]")
+    if "fail_on" in ci:
         lines.append(f"fail_on = {_render_value(ci['fail_on'])}")
-        lines.append("")
+    lines.extend(_MIN_VENDORS_HINT)
+    lines.append("")
 
     for agent in config["agent"]:
         lines.append("[[agent]]")
@@ -291,6 +350,11 @@ def render_toml(config: dict) -> str:
             if value in (None, "", []):
                 continue
             lines.append(f"{key} = {_render_value(value)}")
+        # Only hint at `effort` where the vendor can actually act on it; a hint
+        # under the `claude`/`codex` CLI blocks would invite a setting that only
+        # ever produces an "effort unsupported" warning.
+        if not agent.get("effort") and _effort_supported(agent.get("vendor", "")):
+            lines.append(_EFFORT_HINT)
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

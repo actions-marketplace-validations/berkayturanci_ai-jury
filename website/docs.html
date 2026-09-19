@@ -77,9 +77,13 @@
     </main>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/highlight.min.js"></script>
+  <!-- Subresource Integrity: the browser refuses a script whose bytes differ from the hash,
+       and since #816 this page fails closed when one is refused. Each hash is the published
+       npm package's file (tarball integrity verified), which is what the CDN serves today.
+       Bumping a version means recomputing its hash; tests/test_website_sri.py checks both (#817). -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/highlight.min.js" integrity="sha384-GdEWAbCjn+ghjX0gLx7/N1hyTVmPAjdC2OvoAA0RyNcAOhqwtT8qnbCxWle2+uJX" crossorigin="anonymous"></script>
   <script>
   (function () {
     "use strict";
@@ -99,6 +103,7 @@
       { title: "Guides", items: [
         { slug: "cookbook", file: "cookbook.md", title: "Cookbook" },
         { slug: "theater-design", file: "theater-design.md", title: "Theater mode (--theater)" },
+        { slug: "install", file: "install.md", title: "Installing into an agent" },
         { slug: "platforms", file: "platforms.md", title: "Platform support" },
         { slug: "skill", file: "skill.md", title: "Skill packaging" },
         { slug: "security", file: "security.md", title: "Security" },
@@ -202,13 +207,19 @@
       try { return new URL(href, "https://x/docs/").pathname.replace(/^\//, ""); }
       catch (e) { return href; }
     }
-    function rewrite(container) {
+    function rewrite(container, slug) {
       // links
       Array.prototype.forEach.call(container.querySelectorAll("a[href]"), function (a) {
         var href = a.getAttribute("href");
         if (!href) return;
-        if (/^(https?:)?\/\//i.test(href) || /^(mailto:|#)/i.test(href)) {
-          if (/^https?:\/\//i.test(href)) { a.target = "_blank"; a.rel = "noopener"; }
+        if (/^(https?:)?\/\//i.test(href)) { a.target = "_blank"; a.rel = "noopener"; return; }
+        if (/^mailto:/i.test(href)) { return; }
+        // A pure `#heading` — every document's own contents list. Left as-is it
+        // becomes a location hash with no document in it, so the link works while
+        // the page is open and sends the reader to the home page on reload or on a
+        // shared URL. Carrying the slug makes it a real address.
+        if (/^#/.test(href)) {
+          if (slug && href.length > 1) { a.setAttribute("href", "#" + slug + "--" + href.slice(1)); }
           return;
         }
         var frag = "";
@@ -216,7 +227,13 @@
         if (hashIdx >= 0) { frag = href.slice(hashIdx); href = href.slice(0, hashIdx); }
         if (!href) { return; } // pure fragment handled above
         var path = resolveRel(href);
-        if (FILE_TO_SLUG[path]) { a.setAttribute("href", "#" + FILE_TO_SLUG[path] + (frag && frag !== "#" ? "" : "")); a.removeAttribute("target"); return; }
+        // Keep the fragment. Both arms of the ternary here used to be empty, so
+        // `install.md#cursor` became `#install` and the reader landed on the page
+        // preamble instead of the box the link was written to reach — every
+        // cross-page anchor in the docs silently lost its destination. A location
+        // hash cannot hold two `#`, so the sub-anchor rides along after `--` and
+        // `route()` splits it back off.
+        if (FILE_TO_SLUG[path]) { a.setAttribute("href", "#" + FILE_TO_SLUG[path] + (frag && frag !== "#" ? "--" + frag.slice(1) : "")); a.removeAttribute("target"); return; }
         // other repo file → blob (or raw for assets handled by img)
         a.setAttribute("href", BLOB_ROOT + path + frag);
         a.target = "_blank"; a.rel = "noopener";
@@ -240,19 +257,28 @@
       var toc = $("toc");
       if (!toc) return;
       var heads = container.querySelectorAll("h2, h3");
-      var html = "";
+      var page = location.hash.replace("#", "").split("/")[0] || "";
+      toc.textContent = "";
+      // Built as nodes, never as markup. The headings were sanitized as HTML, and their
+      // text and ids are data from there on: concatenated back into innerHTML, a heading
+      // reading `<agent>` lost that text to the parser, one showing `<img onerror>` as
+      // code became live markup, and an id with a quote left its attribute (#813).
       Array.prototype.forEach.call(heads, function (h) {
         var id = h.id || slugify(h.textContent);
         h.id = id;
-        html += '<a class="ds-sub" data-id="' + id + '" href="#' + (location.hash.replace("#","").split("/")[0] || "") + '" style="' + (h.tagName === "H3" ? "padding-left:1.4rem" : "") + '">' + h.textContent + "</a>";
+        var link = document.createElement("a");
+        link.className = "ds-sub";
+        link.setAttribute("data-id", id);
+        link.setAttribute("href", "#" + page);
+        if (h.tagName === "H3") link.style.paddingLeft = "1.4rem";
+        link.textContent = h.textContent;
+        toc.appendChild(link);
       });
-      toc.innerHTML = html;
       // clicking a TOC item scrolls to heading without changing the doc hash
       Array.prototype.forEach.call(toc.querySelectorAll(".ds-sub"), function (link) {
         link.addEventListener("click", function (e) {
           e.preventDefault();
-          var el = document.getElementById(link.getAttribute("data-id"));
-          if (el) { window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 76, behavior: "smooth" }); }
+          scrollToAnchor(link.getAttribute("data-id"));
           if (window.innerWidth <= 860) {
             sideEl.classList.add("collapsed");
             var mb = $("menu-btn"); if (mb) { mb.setAttribute("aria-expanded", "false"); mb.innerHTML = "☰ Menu"; }
@@ -263,6 +289,7 @@
 
     /* ---- home (index) view ---- */
     function renderHome() {
+      currentSlug = null;
       buildSidebar(null);
       var html = '<p class="docs-kicker">Reference</p><h1 class="docs-h1">Documentation</h1>';
       html += '<p class="docs-lede">Everything about ai-jury, rendered live from the repository\u2019s <code>docs/</code>. Pick a topic.</p>';
@@ -287,7 +314,29 @@
     }
 
     /* ---- doc view ---- */
-    function renderDoc(slug) {
+    // One scroll, with the sticky nav's own offset — the same 76px `buildTOC` uses.
+    // Without it a jump lands with the heading under the header, which is the
+    // difference between "took me there" and "took me nearly there".
+    function scrollToAnchor(id) {
+      if (!id) { return false; }
+      // `getElementById`, not a built selector: the id comes from `location.hash`,
+      // and interpolating that into a CSS selector lets a crafted `#a"]` throw out
+      // of `querySelector` — a lookup has no business parsing anything.
+      var el = document.getElementById(id);
+      // GitHub keeps a run of dashes in a heading slug (`… — …` becomes `---`);
+      // this page's own `slugify` collapses it to one. A markdown link therefore
+      // carries an id this document never assigned, and the jump silently did
+      // nothing. Try the spelling this page uses before giving up.
+      if (!el) { el = document.getElementById(slugify(id)); }
+      if (!el) { return false; }
+      window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 76, behavior: "smooth" });
+      return true;
+    }
+
+    //: The document on screen, so the router can tell "go there" from "scroll here".
+    var currentSlug = null;
+
+    function renderDoc(slug, anchor) {
       var item = BY_SLUG[slug];
       if (!item) { renderHome(); return; }
       buildSidebar(slug);
@@ -297,7 +346,11 @@
         .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
         .then(function (md) {
           var raw = marked.parse(md, { gfm: true, breaks: false });
-          var clean = window.DOMPurify ? DOMPurify.sanitize(raw, { ADD_ATTR: ["target"] }) : raw;
+          // Fail closed: marked does not sanitize, so without DOMPurify the markdown's raw
+          // HTML would go into the page as it is. A page that cannot sanitize shows the
+          // error box and the GitHub link instead (#815).
+          if (!window.DOMPurify) throw new Error("the HTML sanitizer did not load");
+          var clean = DOMPurify.sanitize(raw, { ADD_ATTR: ["target"] });
           var wrap = document.createElement("div");
           wrap.className = "md-body";
           wrap.innerHTML = clean;
@@ -306,7 +359,8 @@
           meta.className = "doc-meta";
           meta.innerHTML = '<span class="doc-source">docs/' + item.file + '</span>'
             + '<a class="doc-edit" href="' + BLOB_ROOT + "docs/" + item.file + '" target="_blank" rel="noopener">View source on GitHub →</a>';
-          rewrite(wrap);
+          currentSlug = slug;
+          rewrite(wrap, slug);
           // syntax highlight code blocks
           if (window.hljs) {
             Array.prototype.forEach.call(wrap.querySelectorAll("pre code"), function (block) {
@@ -318,17 +372,43 @@
           contentEl.appendChild(wrap);
           buildTOC(wrap);
           document.title = item.title + " — ai-jury";
-          // jump to in-page anchor if present (slug#anchor not used; we keep simple)
+          // Jump to the in-page anchor the link carried, once the markdown is in
+          // the DOM. `#install--cursor` means "the install page, at its cursor
+          // box"; without this the hash resolved to the page and stopped there.
+          if (anchor) { scrollToAnchor(anchor); }
         })
         .catch(function (err) {
-          contentEl.innerHTML = '<div class="doc-error"><p><strong>Couldn\u2019t load this doc.</strong></p><p class="mono">' + (err && err.message ? err.message : "fetch failed") + '</p><p><a href="' + BLOB_ROOT + "docs/" + item.file + '" target="_blank" rel="noopener">Read it on GitHub →</a></p></div>';
+          contentEl.innerHTML = '<div class="doc-error"><p><strong>Couldn\u2019t load this doc.</strong></p><p class="mono"></p><p><a href="' + BLOB_ROOT + "docs/" + item.file + '" target="_blank" rel="noopener">Read it on GitHub →</a></p></div>';
+          // The failure's own words, as text: whatever it says, it is not markup (#815).
+          contentEl.querySelector(".mono").textContent = err && err.message ? err.message : "fetch failed";
         });
     }
 
     function route() {
-      var slug = (location.hash || "").replace(/^#/, "").trim();
+      var raw = (location.hash || "").replace(/^#/, "").trim();
+      // Split at the first `--` **only when the prefix is a document we know**.
+      // A GitHub heading slug can contain `--` of its own — the cross-vendor
+      // guard's anchor is `the-cross-vendor-guard---min-vendors` — so splitting
+      // unconditionally handed `route()` a slug that is not a document and an
+      // anchor that is half a heading.
+      var slug = raw, anchor = "";
+      var split = raw.indexOf("--");
+      if (split >= 0 && BY_SLUG[raw.slice(0, split)]) {
+        slug = raw.slice(0, split);
+        anchor = raw.slice(split + 2);
+      }
+      // A bare `#heading` is a link *within* the page already on screen — every
+      // document's own table of contents is written that way. Routing it as a
+      // document slug found no such document and sent the reader to the home
+      // page, silently, from any in-page link they clicked.
       if (!slug) { renderHome(); }
-      else { renderDoc(slug); }
+      // Already on this document: scroll, do not re-render. Re-rendering replaced
+      // the article with a spinner and re-fetched the markdown, so a page's own
+      // contents list reloaded the page it was already showing.
+      else if (slug === currentSlug && scrollToAnchor(anchor)) { return; }
+      else if (BY_SLUG[slug]) { renderDoc(slug, anchor); }
+      else if (scrollToAnchor(slug)) { return; }
+      else { renderHome(); }
       // collapse mobile menu after navigation
       if (window.innerWidth <= 860) {
         sideEl.classList.add("collapsed");

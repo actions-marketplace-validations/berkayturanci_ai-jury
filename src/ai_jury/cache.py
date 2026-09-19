@@ -4,7 +4,7 @@ Re-running the jury against an unchanged diff with an unchanged config
 re-spends time and tokens for an identical result. This module adds an opt-in,
 on-disk cache keyed by everything that can change the outcome: the diff, the
 effective config hash, the prompt-template version, the package version, the
-context policy, and the run seed.
+context policy *and the context text it admits*, and the run seed.
 
 Privacy note: a cache entry stores the full structured outcome — including agent
 review/debate/synthesis text, which is derived from the diff. Treat the cache
@@ -33,9 +33,26 @@ from .config import JuryConfig, config_hash
 from .consensus import FindingGroup
 from .findings import Finding, Verdict
 from .injection import InjectionHit
+from .largediff import ChangeIndex
 from .orchestrator import JuryOutcome
 
-CACHE_SCHEMA = 1
+#: The record *format* version, bumped when a stored outcome gains a field a
+#: renderer reads back. 2 (issue #709, round 2): ``AgentResult`` gained
+#: ``model``, the id the invocation sent, and the ballot reads it to justify
+#: ``model_source: requested``. An entry written without the field cannot
+#: support that label — the run that wrote it did not record what it sent — and
+#: recomputing an id to fill the gap puts a derived value under a token whose
+#: whole claim is that it came off the wire, which is #709 itself. So such an
+#: entry is **not read**: a cache exists to be an exact stand-in for a fresh
+#: run, and where it cannot be, one re-run is the honest price.
+#:
+#: The cache *key* does not settle this on its own. It happens to invalidate
+#: every pre-#709 entry in this release, because ``prompts.PROMPT_VERSION`` went
+#: 7 → 8 for #710 in the same change — but that is a coincidence of two fixes
+#: shipping together. Had #709 landed alone the key would have been unchanged
+#: and every existing entry would have come back a field short. A change to the
+#: record's format belongs in the field that versions the format.
+CACHE_SCHEMA = 2
 _ENV_DIR = "JURY_CACHE_DIR"
 
 # Cache files are named `<64-hex sha256>.json` (entries) or
@@ -73,6 +90,8 @@ def cache_key(
     config: JuryConfig,
     diff: str,
     *,
+    context: str = "",
+    hints: str = "",
     seed: int | None = None,
     mock: bool = False,
     policy=None,
@@ -87,7 +106,48 @@ def cache_key(
     review for the same diff+config, and vice versa. ``policy`` (the repository
     review policy) is fingerprinted in too, since it is injected into the prompts
     and changes the result (issue #122).
+
+    ``context`` is the PR context block (issue #738). The *policy* — the mode and
+    ``redact_secrets`` — was already in the payload, but the text it admits was
+    not, so under ``--context-mode expanded`` the PR title and body were rendered
+    into every Round 1 prompt (and read by the injection scanner) while the key
+    stayed put: editing a PR description, or a third party editing it, changed
+    what the panel was shown and ``--cache`` replayed the previous outcome.
+
+    It is hashed **pre-redaction**, exactly as ``diff`` is: ``run_jury`` redacts
+    both itself, after this key is computed, so the pre-redaction string is what
+    every caller has. Two contexts differing only in a secret therefore key
+    differently even though the panel would see the same redacted text — a
+    conservative split (one extra run, never a stale hit) and not a leak: what is
+    stored is a digest, not the text, it never leaves the machine, and a secret
+    appearing in a PR body is a change to the input this key exists to notice.
+    ``redact_secrets`` is separately in the payload, so the redaction *policy*
+    cannot change under a fixed key either.
+
+    The digest is present only when the panel will actually be shown context —
+    ``run_jury`` clears ``context`` under ``diff-only``, the default mode, before
+    anything reads it. Omitting the field there (rather than hashing ``""``)
+    keeps the payload byte-identical for every run that sends no context, so no
+    existing entry is invalidated for a string the panel never saw. Same
+    precedent as ``[[agent]] adapter`` in ``config_hash`` (#705).
+
+    ``hints`` is the static-analysis pre-pass block (issue #745), and it is here
+    for the reason ``context`` is: it is joined into every Round 1 prompt. The
+    ``hints`` *flag* was already in ``config_hash`` (#715), but the flag says
+    only that the linters ran — the block itself is a function of the **working
+    tree**, not of the diff or the config, so fixing a lint error anywhere in the
+    tree changed what the panel was shown while every other input to this key
+    stood still.
+
+    Unlike ``context`` it takes no mode filter: ``run_jury`` joins the block into
+    the Round 1 prompt *after* the ``diff-only`` filter, precisely so the default
+    context mode cannot discard it (#715), and it is not redacted either. So the
+    string the caller passes is the string the panel is shown, and hashing it
+    when it is non-empty — absent otherwise, by the rule above — leaves a run
+    with ``hints = false``, the default, keyed exactly as it was.
     """
+    # What ``run_jury`` will hand the panel: nothing under "diff-only".
+    panel_context = "" if config.context.mode == "diff-only" else context
     payload = {
         "cache_schema": CACHE_SCHEMA,
         "package_version": __version__,
@@ -104,6 +164,10 @@ def cache_key(
         # rubrics, so the same text must never be served across modes.
         "mode": mode,
     }
+    if panel_context:
+        payload["context_sha256"] = hashlib.sha256(panel_context.encode("utf-8")).hexdigest()
+    if hints:
+        payload["hints_sha256"] = hashlib.sha256(hints.encode("utf-8")).hexdigest()
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -145,6 +209,14 @@ def _agent_result(d: dict | None) -> AgentResult | None:
         warnings=list(d.get("warnings", [])),
         error_code=d.get("error_code"),
         attempts=d.get("attempts", 1),
+        # The id the invocation sent (#709). Restored so a cached ballot quotes
+        # the same string a fresh one does — the cache key already pins the
+        # config, so the id cannot have been anything else. The default is for a
+        # dict that never came from a cache entry (`jury replay` takes any
+        # `outcome_to_dict` dump): a stored entry missing the field is refused
+        # by `CACHE_SCHEMA` before it reaches here, rather than balloting a
+        # recomputed id under a label that claims it was sent.
+        model=d.get("model", ""),
     )
 
 
@@ -166,6 +238,16 @@ def _hit(d: dict) -> InjectionHit:
         source=d.get("source", ""),
         line=d.get("line"),
         snippet=d.get("snippet", ""),
+    )
+
+
+def _change_index(d: dict | None) -> ChangeIndex | None:
+    """Rebuild a :class:`ai_jury.largediff.ChangeIndex`, or None for a legacy entry."""
+    if not isinstance(d, dict):
+        return None
+    return ChangeIndex(
+        paths=tuple(d.get("paths") or ()),
+        symbols=tuple(d.get("symbols") or ()),
     )
 
 
@@ -195,6 +277,29 @@ def outcome_from_dict(data: dict) -> JuryOutcome:
         rounds_executed=data.get("rounds_executed", 1),
         stop_reason=data.get("stop_reason", ""),
         from_cache=data.get("from_cache", False),
+        # What the change contained (#710). The cache key already pins the diff
+        # by digest, so a restored index describes the same bytes as the run
+        # that wrote it; a legacy entry has none and the scope rule falls back.
+        changed=_change_index(data.get("changed")),
+        # The routing record rides along like every other field (#714). An
+        # entry written before this key existed is restored as the standard
+        # record naming the seats it holds, which is what those runs did: the
+        # panel was never trimmed. That is truthful without invalidating a
+        # single cache entry — `routing` and every seat's `tier` are already in
+        # `config_hash`, so a plan that would route differently has a different
+        # key and cannot hit an old entry at all.
+        routing=dict(data["routing"])
+        if data.get("routing")
+        else {
+            "mode": "standard",
+            "risk": "",
+            "panel": [r.get("agent", "") for r in data.get("reviews", [])],
+            "benched": [],
+            "anchor": None,
+            "reason": "standard routing",
+            "escalated": False,
+            "escalation_reason": "",
+        },
     )
 
 

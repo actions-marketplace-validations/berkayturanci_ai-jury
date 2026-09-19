@@ -5,6 +5,8 @@ adds structured outputs intended for tooling:
 
 * :func:`to_json` -- a structured JSON report (schema documented in the README).
 * :func:`to_sarif` -- a SARIF 2.1.0 document for CI / code scanning upload.
+* :func:`to_keel_reviews` -- a per-reviewer review bundle (issue #663) for a
+  consumer that renders one head-pinned verdict per panelist.
 
 Both renderers are deterministic for a deterministic outcome (e.g. under
 ``mock=True``) and only emit legitimate finding fields -- never raw diff or
@@ -21,7 +23,53 @@ from .findings import SEVERITIES, Finding
 from .metadata import build_run_metadata
 
 #: Version of the JSON report schema produced by :func:`to_json`.
-JSON_SCHEMA_VERSION = "1.0"
+#:
+#: 1.1 (issue #663) ADDED the top-level ``reviewers`` array. Nothing was removed,
+#: renamed or reshaped, so every existing consumer of ``findings``/``consensus``/
+#: ``verdicts``/``verdict``/``metadata`` reads an identical document.
+#:
+#: 1.2 (issue #700) adds ``scope``, ``testing``, ``model_source``,
+#: ``scope_substantive`` and ``counts_as_review`` to each ``reviewers`` entry —
+#: and, the reason this is a version bump rather than a silent addition, CHANGES
+#: two things a consumer may have keyed on:
+#:
+#: * ``reviewers[].model`` was "the configured model id, or ``""`` when the CLI's
+#:   default is in force"; it is now never empty for a slot that has an agent,
+#:   carrying either the id actually requested or a statement that the CLI chose
+#:   and does not report which. A consumer testing ``model == ""`` to detect the
+#:   default case must read ``model_source == "cli_default"`` instead.
+#: * the ``reviewers`` array now carries one entry per seat that **ran**, not per
+#:   seat that returned output: a silent agent is recorded as an abstention
+#:   naming it rather than dropped. A consumer counting the non-``chair`` entries
+#:   as reviews must read ``counts_as_review`` (equivalently:
+#:   ``scope_substantive`` and ``verdict != "ABSTAIN"``), which is the same rule
+#:   its own ``review-verdict-insubstantial`` gate applies.
+#:
+#: 1.3 (issues #709, #710) changes nothing structurally and two things
+#: semantically, which is why it is a bump rather than a silent correction:
+#:
+#: * ``reviewers[].model`` under ``model_source: "requested"`` is now the id the
+#:   invocation actually sent, read back off the result the adapter produced. It
+#:   was recomputed from the seat's ``vendor`` while every invocation path
+#:   computes it from the seat's ``adapter``, so on a seat where those differ
+#:   (possible since #705) the ballot could name a model the run never asked for
+#:   — under a field whose whole claim is that it is the id that was sent.
+#: * ``reviewers[].model_source`` gains a fifth value, ``recomputed``: no
+#:   invocation recorded an id for this slot, so the one in ``model`` was derived
+#:   from the run's config. It used to ship as ``requested``, which is the same
+#:   overstatement one source short — the derivation returns
+#:   ``gemini-3-pro-high`` for the seat above, whose adapter sent
+#:   ``gemini-3-pro``. A consumer switching on the four known values must accept
+#:   a fifth.
+#: * ``reviewers[].abstention_cause`` gains a fifth value, ``not_in_change``: the
+#:   seat stated a scope and none of it is in the change under review. Those
+#:   ballots were ``named_nothing`` before, when they were recorded at all — a
+#:   ``Checked:`` line naming anything at all used to make the ballot a **review**
+#:   (#710), so some of these entries were previously counted rather than
+#:   bucketed. A consumer switching on the four known values must accept a fifth.
+#:
+#: Every top-level key, and every ``reviewers`` key, keeps its name and shape.
+JSON_SCHEMA_VERSION = "1.4"
 
 #: Canonical SARIF schema URI and version emitted by :func:`to_sarif`.
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -74,17 +122,20 @@ def _group_dict(g: Any) -> dict[str, Any]:
     }
 
 
-def to_json(outcome: Any, config: Any, *, decision=None, vote=None) -> str:
+def to_json(outcome: Any, config: Any, *, decision=None, vote=None, mode: str = "code") -> str:
     """Render the jury outcome as a structured, pretty-printed JSON report.
 
     Top-level keys: ``schema_version``, ``metadata`` (from
-    :func:`build_run_metadata`), ``findings``, ``consensus``, ``verdicts`` and
-    ``verdict`` (the chair synthesis text, if any). The result is deterministic
-    for a deterministic outcome and contains only legitimate finding fields.
+    :func:`build_run_metadata`), ``findings``, ``consensus``, ``reviewers``,
+    ``verdicts`` and ``verdict`` (the chair synthesis text, if any). The result is
+    deterministic for a deterministic outcome and contains only legitimate finding
+    fields.
 
     ``decision``/``vote`` are threaded into the metadata so the JSON report
     reflects an effective ``--decision vote`` override (issue #248); when omitted
-    the metadata falls back to ``config.decision`` as before.
+    the metadata falls back to ``config.decision`` as before. ``mode`` selects the
+    ballot vocabulary (``code`` → APPROVE/COMMENT/REQUEST_CHANGES, ``issue`` →
+    READY/UNCLEAR/NEEDS_INFO), matching ``--issue``.
     """
     synthesis = getattr(outcome, "synthesis", None)
     verdict_text = ""
@@ -93,11 +144,12 @@ def to_json(outcome: Any, config: Any, *, decision=None, vote=None) -> str:
 
     # Drop the wall-clock timestamp so the report is deterministic for a
     # deterministic run (matching report.py, which omits generated_at too).
-    metadata = build_run_metadata(outcome, config, decision=decision, vote=vote)
+    metadata = build_run_metadata(outcome, config, decision=decision, vote=vote, mode=mode)
     metadata.pop("generated_at", None)
 
     # Surface the deterministic PR-level classification (issue #7) at the top
     # level for easy machine consumption (it is also embedded in ``metadata``).
+    from .ballots import reviewer_ballots
     from .classification import classify
 
     doc: dict[str, Any] = {
@@ -106,6 +158,9 @@ def to_json(outcome: Any, config: Any, *, decision=None, vote=None) -> str:
         "classification": classify(outcome),
         "findings": [_finding_dict(f) for f in outcome.findings],
         "consensus": [_group_dict(g) for g in outcome.groups],
+        # Per-reviewer ballots (issue #663): who said what, with vendor/model
+        # provenance. Purely additive — every key above is unchanged.
+        "reviewers": reviewer_ballots(outcome, config, vote=vote, mode=mode),
         "verdicts": [
             {
                 "file": v.file,
@@ -119,6 +174,31 @@ def to_json(outcome: Any, config: Any, *, decision=None, vote=None) -> str:
         "verdict": verdict_text,
     }
     return json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False)
+
+
+def to_keel_reviews(outcome: Any, config: Any, *, vote=None, mode: str = "code") -> str:
+    """Render the panel as a per-reviewer review bundle (issue #663).
+
+    A JSON **array** — not an object — of ``{reviewer, verdict, scope, findings,
+    testing, vendor, model, model_source, counts_as_review}`` records, one per
+    seat that ran plus the chair as ``reviewer: "chair"``. That is the payload
+    keel's ``keel review --reviews <file>`` accepts, so a panel run can *be* the
+    review rather than merely inform one. A seat that returned nothing is present
+    as an abstention naming it, and ``counts_as_review`` is how a consumer tells
+    the reviews from the records of seats that did not review.
+
+    Deterministic for a deterministic outcome. Free text lifted from agent replies
+    (``scope``, ``testing``) is flattened and capped in :mod:`ai_jury.ballots`; no
+    diff text, prompt text or secret ever reaches this document.
+    """
+    from .ballots import keel_reviews
+
+    return json.dumps(
+        keel_reviews(outcome, config, vote=vote, mode=mode),
+        indent=2,
+        sort_keys=False,
+        ensure_ascii=False,
+    )
 
 
 def _sarif_result(f: Finding) -> dict[str, Any]:

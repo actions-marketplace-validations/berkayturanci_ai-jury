@@ -16,6 +16,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from . import panel
+from .config import normalise_vendor, vendor_identity
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import JuryConfig
     from .orchestrator import JuryOutcome
@@ -25,7 +28,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # v4 (issue #501) added: ``panel`` (configured vs effective size, abstentions) and
 # per-agent ``review_status``. A slot that returns no review is an abstention, not an
 # approval, and until now nothing in the output said so.
-SCHEMA_VERSION = 4
+# v5 (issues #699/#700) added, inside ``panel``: ``ballots``, ``reviews_supplied``,
+# ``silent``, ``insubstantial``, ``refused``, ``adapter_failed``, ``chair`` and
+# ``chair_ballot`` — the number of reviews a downstream consumer actually
+# receives (the ballots that named something and voted; the chair's synthesis
+# record is not one of them, and neither is an abstaining ballot), the ways
+# a seat that ran produced no review, and whether the chairing agent's own ballot
+# is one of the counted reviews. The causes and ``reviews_supplied`` sum to
+# ``ballots``. Purely additive: every v4 key keeps its name and meaning.
+# v6 (issue #710) added, inside ``panel``: ``not_in_change`` — the seats whose
+# stated scope named only paths or symbols the change does not contain. Split
+# out of ``insubstantial``, which keeps meaning exactly "answered and named
+# nothing checkable": naming `src/made/up.py` is a different failure from naming
+# nothing, and the two ask for different fixes. Additive, and the buckets still
+# sum to ``ballots`` — the seats moved between buckets, none was added or lost.
+SCHEMA_VERSION = 7
 
 
 #: What a reviewer slot actually contributed (issue #501). ``clean`` and
@@ -51,7 +68,7 @@ def review_status(result) -> str:
     return "clean" if getattr(result, "structured", False) else "abstained"
 
 
-def panel_accounting(reviews) -> dict:
+def panel_accounting(reviews, chair: str = "", ballots=None) -> dict:
     """Configured versus *effective* panel size, and the per-status breakdown.
 
     A consumer gating on the panel needs the effective number — keel downgrades a
@@ -59,8 +76,64 @@ def panel_accounting(reviews) -> dict:
     report says the panel was short. ``vendors`` counts distinct vendors that
     actually contributed a review, which is the number that matters for
     cross-vendor consensus: three slots from one vendor are not three perspectives.
+
+    Vendors are counted by :func:`config.vendor_identity`, not by the raw
+    string: a seat whose vendor the tool does not recognise ran on the generic
+    ``cli`` fallback and is counted as ``cli``, so two unidentifiable seats are
+    one vendor here even though the report still names each one honestly
+    (issue #701).
+
+    ``reviews_supplied`` is a different number again, and the one #699 was about:
+    how many reviews the bundle hands on. It is not ``configured`` (every seat
+    that ran, silent ones included), not ``effective`` (a slot that returned
+    prose but no findings block may still have named nothing), and not
+    ``ballots`` plus the chair record — a consumer splits the ``reviewers`` array
+    on ``role`` and reads the ``chair`` entry as the panel's consensus rather
+    than as one more review.
+
+    It is :func:`ai_jury.panel.review_count` over the **ballot records**, which
+    is why they are passed in rather than derived here: whether a seat reviewed
+    is a fact about the record it produced — its scope and its verdict — and no
+    predicate over the raw round-1 result can see it. That was the defect at this
+    line (#700, round 2): a prose-only non-review abstained on its ballot and was
+    still counted here, so ``--min-reviews`` could be satisfied by seats that
+    reviewed nothing. With ``ballots`` omitted the count is reported as ``None``
+    rather than guessed, because every guess available over-counts.
+
+    ``silent``, ``insubstantial``, ``refused`` and ``adapter_failed`` split the
+    seats that produced no review by cause, for the shortfall message: a silent
+    agent is a CLI that broke or a budget that ran out, a seat that answered and
+    named nothing is a reviewer that did not review, a refusal is a model
+    declining the task, and a failed adapter is an invocation to fix. They come
+    from :func:`ai_jury.panel.abstention_buckets` — each ballot classified by the
+    cause it carries — so that they and ``reviews_supplied`` add up to
+    ``ballots`` with nothing left over.
+
+    ``insubstantial`` was derived by subtraction until #700's fifth round, and
+    the subtraction was the defect: ``ballots - silent - supplied`` swept up
+    every seat that was neither silent nor a counted review, and once a ballot
+    could carry a substantive scope and still abstain that included the seat that
+    named a file and then refused, and the one whose adapter died holding a file
+    name. Both were then rendered as "named nothing checkable" — a cause their
+    own ballot contradicted. It now means exactly ``named_nothing``: the seats
+    that answered and named nothing a reader could check, and only those.
+
+    ``chair_ballot`` says whether the chairing agent's own ballot is one of the
+    *counted* reviews — a chairing agent that ran and abstained has a ballot in
+    the bundle and has supplied no review.
     """
     reviews = list(reviews or [])
+    seats = panel.ballot_seats(reviews)
+    records = list(ballots) if ballots is not None else None
+    counted = [r for r in (records or []) if panel.is_review(r)]
+    supplied = len(counted) if records is not None else None
+    # Without the records there is nothing to classify: the cause is a fact the
+    # ballot carries, and every guess available from the raw results is the
+    # subtraction this replaced. ``silent`` is the exception, and only because
+    # :func:`ai_jury.ballots.abstention_cause` tests silence first and on the
+    # same predicate — the two readings are the same number by construction.
+    buckets = panel.abstention_buckets(records) if records is not None else None
+    silent = sum(1 for r in seats if not panel.responded(r))
 
     # bolt: Consolidate multiple metrics into a single-pass O(N) explicit loop
     effective_count = 0
@@ -72,7 +145,7 @@ def panel_accounting(reviews) -> dict:
         st = review_status(r)
         if st in ("findings", "clean"):
             effective_count += 1
-            vendor = getattr(r, "vendor", "")
+            vendor = vendor_identity(getattr(r, "vendor", ""))
             if vendor:
                 contributing_vendors.add(vendor)
         elif st == "abstained":
@@ -87,7 +160,73 @@ def panel_accounting(reviews) -> dict:
         "abstained": abstained_count,
         "failed": failed_count,
         "short": effective_count < len(reviews),
+        # One ballot record per seat that ran — including a silent one, recorded
+        # as an abstention so the report can name it. Deliberately no longer the
+        # same number as ``reviews_supplied``.
+        "ballots": len(seats),
+        "reviews_supplied": supplied,
+        # One entry per cause, from the one mapping, so a bucket cannot be added
+        # in `panel` and go unpublished here. ``silent`` is the only one that
+        # survives a call with no ballots, because it is the only one the raw
+        # results can answer.
+        **{
+            key: (buckets[cause] if buckets is not None else None)
+            for cause, key in panel.PANEL_METADATA_KEYS.items()
+        },
+        "silent": buckets[panel.SILENT] if buckets is not None else silent,
+        "chair": chair or "",
+        "chair_ballot": bool(chair) and any(r.get("name", "") == chair for r in counted),
     }
+
+
+def distinct_vendors(specs) -> int:
+    """How many distinct vendors a set of agent specs represents (pure).
+
+    Slots, not vendors, is the mistake this exists to prevent: three
+    ``[[agent]]`` entries all pointing at one vendor are one perspective, so a
+    run configured that way never claimed cross-vendor consensus and must not be
+    failed for not delivering it.
+
+    Counted by :func:`config.vendor_identity`, so a pair of seats naming
+    vendors this build does not know collapses to the single ``cli`` identity
+    they actually share (issue #701) rather than reading as two.
+    """
+    return len({vendor_identity(getattr(s, "vendor", "")) for s in specs or []} - {""})
+
+
+def collapse_reason(reviews, required: int, configured_vendors: int | None = None) -> str | None:
+    """Why this run may not stand as cross-vendor consensus, or ``None``.
+
+    PURE. ``required`` is the number of distinct vendors that must have
+    *contributed* a review (:func:`panel_accounting`'s ``vendors``), not the
+    number configured — an agent that was installed, probed clean and then
+    returned nothing is exactly the failure this guards (#635/#682).
+
+    ``configured_vendors`` scopes the DEFAULT: when fewer distinct vendors are
+    enabled than ``required``, the run never claimed cross-vendor consensus and
+    is left alone, so turning the guard on by default cannot fail a
+    single-vendor install that was always honest about being one. Pass ``None``
+    for an explicitly requested threshold, which is enforced as asked.
+
+    The message NAMES the opt-out. Whoever reads it is looking at a red CI step
+    on a gate that ships on by default, quite possibly for the first time, and a
+    failure that does not say how to accept it sends them to the issue tracker
+    for a flag the tool already has.
+    """
+    if required <= 0:
+        return None
+    if configured_vendors is not None and configured_vendors < required:
+        return None
+    contributed = panel_accounting(reviews).get("vendors", 0)
+    if contributed >= required:
+        return None
+    return (
+        f"panel collapsed: {contributed} vendor(s) contributed a review, "
+        f"{required} required. An abstention is not an approval; "
+        f"cross-vendor consensus was not formed. To accept a collapsed panel, "
+        f"pass --no-min-vendors (or set [jury.ci] min_vendors = 0); to catch a "
+        f"missing CLI at startup instead, run with --strict."
+    )
 
 
 def _agent_entry(result) -> dict:
@@ -98,6 +237,9 @@ def _agent_entry(result) -> dict:
     """
     return {
         "name": result.agent,
+        # PROVENANCE: the vendor string as configured, never the collapsed
+        # identity. `panel.vendors` is the gate's count of `vendor_identity`;
+        # this is what the seat said it was (#701).
         "vendor": result.vendor,
         "status": "ok" if result.ok else "failed",
         "duration_s": round(float(result.duration_s), 3),
@@ -150,7 +292,7 @@ def estimate_economics(results: list) -> dict:
 
     for r in results:
         agent = getattr(r, "agent", "unknown")
-        vendor = (getattr(r, "vendor", "") or "").lower()
+        vendor = normalise_vendor(getattr(r, "vendor", ""))
         output_len = len(getattr(r, "output", "") or "")
         # Heuristic: base prompt ~800 tokens + output tokens
         tokens_est = max(100, 800 + (output_len // 4)) if getattr(r, "ok", False) else 200
@@ -189,7 +331,7 @@ def estimate_economics(results: list) -> dict:
 
 
 def build_run_metadata(
-    outcome: JuryOutcome, config: JuryConfig, *, decision=None, vote=None
+    outcome: JuryOutcome, config: JuryConfig, *, decision=None, vote=None, mode: str = "code"
 ) -> dict:
     """Return a machine-readable metadata dict for a jury run.
 
@@ -200,6 +342,12 @@ def build_run_metadata(
     summed across every phase (review, debate, verify, synthesis) so it captures
     the full run cost proxy even though debate/verify/synthesis are re-runs of
     panel agents rather than distinct participants.
+
+    ``mode`` selects the ballot vocabulary, matching ``--issue``. It reaches here
+    because ``panel.reviews_supplied`` is counted over the **ballots** (#700,
+    round 2), and the ballots are what ``--issue`` changes: the metadata and the
+    ``reviewers`` array must be derived under the same mode, or the run's own
+    gate would count a different document than the one it printed.
     """
     # The panel is the set of round-1 participants; this is the canonical
     # per-agent view and avoids duplicating the chair across later phases.
@@ -216,6 +364,7 @@ def build_run_metadata(
     # effective config let a run be reproduced/explained. The seed is whatever
     # the run was configured with (may be None when unseeded). The config hash
     # is a pure function of config, so it is stable across runs and over time.
+    from .ballots import reviewer_ballots
     from .classification import classify
     from .config import config_hash
 
@@ -248,11 +397,19 @@ def build_run_metadata(
         "agents": agents,
         # Configured vs effective panel size (issue #501): a slot that returned no
         # review is an abstention, not an approval, and must not inflate the panel.
-        "panel": panel_accounting(outcome.reviews),
+        "panel": panel_accounting(
+            outcome.reviews,
+            chair=getattr(outcome, "chair", "") or "",
+            ballots=reviewer_ballots(outcome, config, vote=vote, mode=mode),
+        ),
         "economics": estimate_economics(all_results),
         "rounds_executed": _rounds_executed(outcome),
         "from_cache": bool(getattr(outcome, "from_cache", False)),
         "stop_reason": getattr(outcome, "stop_reason", "") or "",
+        # What routing decided (#714): mode, risk band, who sat, who was benched,
+        # the anchor, and whether round 1 escalated. The standard mode records
+        # {mode: "standard", panel: [...]} so the key is always present.
+        "routing": dict(getattr(outcome, "routing", None) or {"mode": "standard"}),
         "skipped": skipped,
         "retried": retried,
         "budget_exhausted": bool(getattr(outcome, "budget_exhausted", False)),

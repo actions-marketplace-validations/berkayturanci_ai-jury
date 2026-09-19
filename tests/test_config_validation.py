@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+import tomllib
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -12,11 +14,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import tempfile  # noqa: E402
 
-from ai_jury.config import (  # noqa: E402
+from ai_jury.config import (
+    _NUMERIC_BOUNDS,
+    DEFAULT_CONFIG,
+    KNOWN_AGENT_KEYS,
+    KNOWN_CI_KEYS,
+    KNOWN_CONTEXT_KEYS,
+    KNOWN_DIFF_KEYS,
+    KNOWN_EFFORTS,
+    KNOWN_JURY_KEYS,
+    KNOWN_NESTED_JURY_KEYS,
+    AgentSpec,
     ConfigError,
+    JuryConfig,
+    _ci_from_dict,
+    _context_from_dict,
+    _diff_from_dict,
+    _from_dict,
+    bound_error,
+    config_hash,
+    load_config,
     load_raw_config,
     validate_config,
 )
+from ai_jury.findings import SEVERITY_INPUTS  # noqa: E402
 
 
 class ConfigSizeLimit(unittest.TestCase):
@@ -125,6 +146,545 @@ class HardErrors(unittest.TestCase):
     def test_no_agents(self):
         with self.assertRaises(ConfigError):
             validate_config({"jury": {"rounds": 1}, "agent": []})
+
+
+class NumericBounds(unittest.TestCase):
+    """`bound_error` is the one reader of the `[jury]` numeric rules (#748).
+
+    Both surfaces call it: `validate_config` for the TOML key and the CLI for
+    the flag that writes the same setting, so a bound cannot be stated twice and
+    drift apart.
+    """
+
+    def test_a_value_at_the_minimum_passes(self):
+        for setting, (minimum, _phrase, _optional) in _NUMERIC_BOUNDS.items():
+            with self.subTest(setting=setting):
+                self.assertIsNone(bound_error(setting, minimum))
+
+    def test_a_value_below_the_minimum_is_refused_and_quoted_back(self):
+        for setting, (minimum, _phrase, _optional) in _NUMERIC_BOUNDS.items():
+            with self.subTest(setting=setting):
+                message = bound_error(setting, minimum - 1)
+                self.assertIsNotNone(message)
+                self.assertTrue(message.startswith(f"jury.{setting} must be "))
+                self.assertIn(f"(got {minimum - 1}).", message)
+
+    def test_an_absent_optional_setting_passes_and_a_required_one_does_not(self):
+        self.assertIsNone(bound_error("max_rounds", None))
+        self.assertIsNotNone(bound_error("rounds", None))
+
+    def test_a_bool_is_not_an_integer(self):
+        # `rounds = true` is a mistake, not `rounds = 1`.
+        self.assertIsNotNone(bound_error("rounds", True))
+
+    def test_a_non_integer_is_refused(self):
+        self.assertIsNotNone(bound_error("rounds", "2"))
+        self.assertIsNotNone(bound_error("timeout", 1.5))
+
+    def test_only_an_optional_setting_says_when_set(self):
+        self.assertIn(" when set ", bound_error("max_rounds", 0))
+        self.assertNotIn(" when set ", bound_error("rounds", 0))
+
+    def test_where_replaces_the_config_path_and_nothing_else(self):
+        # What the CLI passes so an operator with no jury.toml is not pointed at
+        # a key they never wrote; the rule either side of it is identical.
+        self.assertEqual(
+            bound_error("rounds", 0, where="--rounds"),
+            bound_error("rounds", 0).replace("jury.rounds", "--rounds", 1),
+        )
+
+
+class ApiKeyEnvNameValidation(unittest.TestCase):
+    """`api_key_env` names an env var and is displayed, so it is bounded (#669)."""
+
+    @staticmethod
+    def _with(value):
+        return {
+            "jury": {"rounds": 1, "chair": "a"},
+            "agent": [
+                {
+                    "name": "a",
+                    "vendor": "openai-compatible",
+                    "model": "m",
+                    "endpoint": "http://localhost:9/v1",
+                    "api_key_env": value,
+                }
+            ],
+        }
+
+    def test_a_valid_name_is_accepted_silently(self):
+        self.assertEqual(validate_config(self._with("MY_TOKEN_VAR")), [])
+
+    def test_a_malformed_name_warns_rather_than_failing(self):
+        # Soft, not hard: the vendor default still works, but a silent fallback
+        # would leave the operator wondering why their variable is ignored.
+        warnings = validate_config(self._with('EVIL", "injected": "yes'))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("is not a valid environment variable name", warnings[0])
+
+    def test_the_rejected_value_is_never_quoted_back(self):
+        # Reaching this branch means the value holds characters outside the safe
+        # set — the very class that must not be written to a terminal. The
+        # message locates the problem (agent name + rule) without reproducing it.
+        for hostile, marker in (
+            ('EVIL", "injected": "yes', "injected"),
+            ("TWO\nLINES", "TWO"),
+            ("ansi\x1b[31mred", "\x1b"),
+        ):
+            warning = validate_config(self._with(hostile))[0]
+            self.assertNotIn(marker, warning, hostile)
+            self.assertIn("api_key_env", warning)
+            self.assertIn("agent 'a'", warning)
+
+    def test_the_message_states_the_rule_it_enforces(self):
+        from ai_jury.redaction import ENV_VAR_NAME_RULE
+
+        self.assertIn(ENV_VAR_NAME_RULE, validate_config(self._with("bad name"))[0])
+
+    def test_a_newline_in_the_name_warns(self):
+        self.assertTrue(validate_config(self._with("TWO\nLINES")))
+
+    def test_absent_key_produces_no_warning(self):
+        data = self._with("X")
+        del data["agent"][0]["api_key_env"]
+        self.assertEqual(validate_config(data), [])
+
+
+class EffortValidation(unittest.TestCase):
+    """`[[agent]] effort` is a closed enum — a typo is a hard error (issue #662)."""
+
+    @staticmethod
+    def _with_effort(value):
+        return {
+            "jury": {"rounds": 1, "chair": "a"},
+            "agent": [{"name": "a", "vendor": "openai-api", "model": "m", "effort": value}],
+        }
+
+    def test_every_known_level_is_accepted(self):
+        for level in KNOWN_EFFORTS:
+            self.assertEqual(validate_config(self._with_effort(level)), [])
+
+    def test_case_and_padding_are_tolerated(self):
+        self.assertEqual(validate_config(self._with_effort("  HIGH ")), [])
+
+    def test_unknown_level_is_a_hard_error(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_effort("maximum"))
+        self.assertIn("effort must be one of", str(ctx.exception))
+
+    def test_non_string_effort_is_a_hard_error(self):
+        for value in (3, True, ["high"]):
+            with self.assertRaises(ConfigError):
+                validate_config(self._with_effort(value))
+
+    def test_effort_is_a_known_agent_key(self):
+        # Not merely accepted: it must not produce an "unknown key" warning.
+        self.assertIn("effort", KNOWN_AGENT_KEYS)
+        self.assertEqual(validate_config(self._with_effort("low")), [])
+
+    def test_effort_is_normalized_and_hashed(self):
+        cfg = _from_dict(self._with_effort(" High "))
+        self.assertEqual(cfg.agents[0].effort, "high")
+        other = _from_dict(self._with_effort("low"))
+        # Effort changes the request an agent sends, so it must split the cache key.
+        self.assertNotEqual(config_hash(cfg), config_hash(other))
+
+    def test_absent_effort_stays_none(self):
+        cfg = _from_dict(
+            {"jury": {"rounds": 1, "chair": "a"}, "agent": [{"name": "a", "command": "x"}]}
+        )
+        self.assertIsNone(cfg.agents[0].effort)
+
+
+class TierValidation(unittest.TestCase):
+    """`[[agent]] tier` is `frontier` or `economical`, and nothing else (#714).
+
+    Hard, like `effort`, and for the same reason: an unknown spelling read as
+    the default would treat the seat as frontier — the opposite of what an
+    operator who wrote `tier = "cheap"` meant.
+    """
+
+    @staticmethod
+    def _with_tier(value):
+        agent = {"name": "a", "vendor": "anthropic", "command": "claude"}
+        if value is not None:
+            agent["tier"] = value
+        return {"jury": {"rounds": 1, "chair": "a"}, "agent": [agent]}
+
+    def test_the_two_kinds_are_accepted_case_insensitively(self):
+        for value, expected in (("frontier", "frontier"), ("Economical", "economical")):
+            with self.subTest(value=value):
+                data = self._with_tier(value)
+                self.assertEqual(validate_config(data), [])
+                self.assertEqual(_from_dict(data).agents[0].tier, expected)
+
+    def test_unset_means_frontier(self):
+        data = self._with_tier(None)
+        self.assertEqual(validate_config(data), [])
+        self.assertEqual(_from_dict(data).agents[0].tier, "frontier")
+
+    def test_an_unknown_kind_is_a_hard_error_naming_the_agent(self):
+        for value in ("cheap", 3, ""):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError) as ctx:
+                    validate_config(self._with_tier(value))
+                self.assertIn(
+                    "agent 'a' tier must be one of frontier, economical", str(ctx.exception)
+                )
+
+    def test_the_spec_never_carries_an_unknown_spelling(self):
+        # The reader normalises on construction, so no rule downstream can be
+        # handed a tier the vocabulary does not have.
+        self.assertEqual(AgentSpec("a", "anthropic", tier=" ECONOMICAL ").tier, "economical")
+        self.assertEqual(AgentSpec("a", "anthropic", tier="cheap").tier, "frontier")
+
+    def test_economical_splits_the_cache_key_and_the_default_does_not(self):
+        base = _from_dict(self._with_tier(None))
+        explicit_default = _from_dict(self._with_tier("frontier"))
+        economical = _from_dict(self._with_tier("economical"))
+        self.assertEqual(config_hash(base), config_hash(explicit_default))
+        self.assertNotEqual(config_hash(base), config_hash(economical))
+
+
+class RoutingValidation(unittest.TestCase):
+    """`[jury] routing` is `standard` or `tiered`, and nothing else (#747).
+
+    Hard, like `[[agent]] tier`, its companion key, and for the same reason: the
+    routed panel is selected by comparing against the literal `"tiered"`, so an
+    unknown spelling takes the `standard` path — an operator who wrote
+    `routing = "teired"` pays for the uniform panel while believing they asked
+    for the cheap one, and nothing anywhere says so.
+    """
+
+    @staticmethod
+    def _with_routing(value):
+        jury = {"rounds": 1, "chair": "a"}
+        if value is not None:
+            jury["routing"] = value
+        return {"jury": jury, "agent": [{"name": "a", "vendor": "anthropic", "command": "claude"}]}
+
+    def test_the_two_kinds_are_accepted_case_insensitively(self):
+        for value, expected in (("standard", "standard"), ("Tiered", "tiered")):
+            with self.subTest(value=value):
+                data = self._with_routing(value)
+                self.assertEqual(validate_config(data), [])
+                self.assertEqual(_from_dict(data).routing, expected)
+
+    def test_unset_means_standard(self):
+        data = self._with_routing(None)
+        self.assertEqual(validate_config(data), [])
+        self.assertEqual(_from_dict(data).routing, "standard")
+
+    def test_an_unknown_kind_is_a_hard_error_naming_the_value(self):
+        # The issue's typo included: it read as `standard` and said nothing.
+        for value in ("teired", 3, ""):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError) as ctx:
+                    validate_config(self._with_routing(value))
+                self.assertIn("jury.routing must be one of standard, tiered", str(ctx.exception))
+                self.assertIn(repr(value), str(ctx.exception))
+
+    def test_the_config_never_carries_an_unknown_spelling(self):
+        # The reader normalises on construction, so no rule downstream can be
+        # handed a routing kind the vocabulary does not have — including the
+        # readers that load without validating (`--doctor`, `jury run-agent`).
+        self.assertEqual(JuryConfig(routing=" TIERED ").routing, "tiered")
+        self.assertEqual(JuryConfig(routing="teired").routing, "standard")
+        self.assertEqual(JuryConfig(routing=None).routing, "standard")
+
+    def test_the_documented_tiered_example_stays_strict_clean(self):
+        # `docs/configuration.md` teaches `routing = "tiered"`; a vocabulary that
+        # rejected the documented spelling would fail the very gate the doc tells
+        # the reader to run. `DocumentedExamplesAreStrictClean` scans the doc
+        # itself; this pins the value that scan must keep accepting.
+        self.assertEqual(validate_config(self._with_routing("tiered"), strict=True), [])
+
+
+class PromptModeIsPartOfTheRunIdentity(unittest.TestCase):
+    """`config_hash` covers `[[agent]] prompt_mode` (#746).
+
+    Same class as `headers`/`api_key_env` (#716) and `adapter` (#705): a field
+    that decides how a seat is *invoked* has to be part of the run's identity,
+    or `--cache` serves the outcome of one invocation protocol for a run
+    configured with the other. `stdin` pipes the prompt; `arg` appends it to
+    argv. Every sibling of `AgentSpec` that steers invocation was already here.
+    """
+
+    @staticmethod
+    def _with_prompt_mode(value):
+        agent = {"name": "a", "vendor": "cli", "command": "my-agent"}
+        if value is not None:
+            agent["prompt_mode"] = value
+        return {"jury": {"rounds": 1, "chair": "a"}, "agent": [agent]}
+
+    def test_the_two_delivery_protocols_hash_differently(self):
+        stdin = _from_dict(self._with_prompt_mode("stdin"))
+        arg = _from_dict(self._with_prompt_mode("arg"))
+        self.assertNotEqual(config_hash(stdin), config_hash(arg))
+
+    def test_the_cache_key_of_a_config_that_names_no_prompt_mode_is_untouched(self):
+        # No one's review cache is invalidated by a key they did not set: the
+        # field reaches the payload only when it was written, so the canonical
+        # payload of every configuration written before #746 — and of one that
+        # spells the unset state out as an empty string, which `_from_dict`
+        # folds to `None` and the adapter reads as `stdin` — is byte-identical
+        # to what it hashed to before.
+        base = _from_dict(self._with_prompt_mode(None))
+        empty = _from_dict(self._with_prompt_mode(""))
+        self.assertIsNone(base.agents[0].prompt_mode)
+        self.assertIsNone(empty.agents[0].prompt_mode)
+        self.assertEqual(config_hash(base), config_hash(empty))
+        self.assertNotEqual(
+            config_hash(base), config_hash(_from_dict(self._with_prompt_mode("arg")))
+        )
+
+    def test_the_two_protocols_build_the_argv_the_hash_claims_they_do(self):
+        # The hash is only worth splitting if the seats really are invoked
+        # differently: `arg` appends the prompt and sends no stdin, `stdin` pipes
+        # it and leaves argv alone. Asserted rather than assumed.
+        from ai_jury.adapters import make_adapter
+
+        built = {}
+        for value in ("stdin", "arg"):
+            spec = _from_dict(self._with_prompt_mode(value)).agents[0]
+            adapter = make_adapter(spec)
+            built[value] = (adapter.build_argv("PROMPT"), adapter._stdin_for("PROMPT"))
+        self.assertNotEqual(built["stdin"], built["arg"])
+        self.assertEqual(built["stdin"][1], "PROMPT")
+        self.assertIsNone(built["arg"][1])
+        self.assertEqual(built["arg"][0][-1], "PROMPT")
+
+
+class FailOnVocabulary(unittest.TestCase):
+    """`[jury.ci] fail_on` is a closed vocabulary — a typo is a hard error (#718).
+
+    A misspelled severity matches no finding group, so the one setting that
+    decides whether CI fails would pass green forever, quoting the typo back.
+    """
+
+    @staticmethod
+    def _with_fail_on(value):
+        return {
+            "jury": {"rounds": 1, "chair": "a", "ci": {"fail_on": value}},
+            "agent": [{"name": "a", "vendor": "openai", "command": "codex"}],
+        }
+
+    def test_every_known_severity_is_accepted(self):
+        self.assertEqual(validate_config(self._with_fail_on(list(SEVERITY_INPUTS))), [])
+
+    def test_case_and_padding_are_tolerated(self):
+        self.assertEqual(validate_config(self._with_fail_on([" CRITICAL ", "Blocker"])), [])
+
+    def test_a_scalar_is_accepted_because_the_loader_wraps_one(self):
+        self.assertEqual(validate_config(self._with_fail_on("critical")), [])
+        self.assertEqual(_from_dict(self._with_fail_on("critical")).ci.fail_on, ["critical"])
+
+    def test_empty_list_is_accepted(self):
+        # An explicitly empty gate blocks nothing, which is a choice, not a typo.
+        self.assertEqual(validate_config(self._with_fail_on([])), [])
+
+    def test_typo_is_a_hard_error_naming_the_value(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_fail_on(["crticial", "majr"]))
+        message = str(ctx.exception)
+        self.assertIn("jury.ci.fail_on", message)
+        self.assertIn("crticial", message)
+        self.assertIn("majr", message)
+        self.assertIn("critical, major, minor, nit, info, blocker", message)
+
+    def test_a_typo_beside_a_valid_severity_is_still_refused(self):
+        # The gate would half-work, which is the shape that hides for months.
+        with self.assertRaises(ConfigError):
+            validate_config(self._with_fail_on(["critical", "hihg"]))
+
+    def test_scalar_typo_is_a_hard_error(self):
+        with self.assertRaises(ConfigError):
+            validate_config(self._with_fail_on("majr"))
+
+    def test_absent_ci_table_is_accepted(self):
+        data = {
+            "jury": {"rounds": 1, "chair": "a"},
+            "agent": [{"name": "a", "vendor": "openai", "command": "codex"}],
+        }
+        self.assertEqual(validate_config(data), [])
+
+    def test_non_table_ci_is_a_hard_error(self):
+        data = {
+            "jury": {"rounds": 1, "chair": "a", "ci": "critical"},
+            "agent": [{"name": "a", "vendor": "openai", "command": "codex"}],
+        }
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(data)
+        self.assertIn("[jury.ci] must be a table", str(ctx.exception))
+
+    def test_the_shipped_default_config_passes_its_own_gate(self):
+        self.assertEqual(validate_config(DEFAULT_CONFIG), [])
+
+
+class HeadersValidation(unittest.TestCase):
+    """`[[agent]] headers` is checked, and the severity follows usability (#716).
+
+    The old behaviour is what makes the shape errors hard rather than soft:
+    `_from_dict` coerced every non-table to `{}`, so a misspelled or mis-typed
+    `headers` passed `--config-validate` AND `--strict-config` and the seat ran
+    with no extra headers at all. For a routing header the provider honours by
+    default, that is a run against a backend nobody chose.
+
+    The split is this module's usual one, applied here (review r1): a shape that
+    cannot become headers is a hard error (not a table; a non-string key), and a
+    shape that becomes working headers by a documented coercion is a warning (a
+    non-string VALUE — `X-Retries = 3` is sent as `X-Retries: 3`), exactly as a
+    malformed `api_key_env` name warns and falls back.
+    """
+
+    @staticmethod
+    def _with_headers(value):
+        return {
+            "jury": {"rounds": 1, "chair": "a"},
+            "agent": [
+                {
+                    "name": "a",
+                    "vendor": "openai-compatible",
+                    "model": "m",
+                    "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+                    "headers": value,
+                }
+            ],
+        }
+
+    def test_a_table_of_strings_is_accepted_and_materialised(self):
+        data = self._with_headers({"X-Route": "premium", "HTTP-Referer": "https://ai-jury.org"})
+        self.assertEqual(validate_config(data), [])
+        self.assertEqual(
+            _from_dict(data).agents[0].headers,
+            {"X-Route": "premium", "HTTP-Referer": "https://ai-jury.org"},
+        )
+
+    def test_a_string_is_a_hard_error_naming_the_agent(self):
+        # The issue's own reproduction: TOML written as `headers = "A = B"`.
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_headers("Authorization = Bearer y"))
+        message = str(ctx.exception)
+        self.assertIn("agent 'a' headers must be a table", message)
+        self.assertIn("got str", message)
+
+    def test_a_list_is_a_hard_error(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_headers([["X-Route", "premium"]]))
+        self.assertIn("agent 'a' headers must be a table", str(ctx.exception))
+
+    def test_a_non_string_value_warns_and_is_coerced(self):
+        """`X-Retries = 3` is a working header, so it warns rather than fails."""
+        data = self._with_headers({"X-Retries": 3})
+        warnings = validate_config(data)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("agent 'a' headers value for 'X-Retries'", warnings[0])
+        self.assertIn("int", warnings[0])
+        self.assertIn("coerced", warnings[0])
+        # And the coercion the warning describes is the one that happens.
+        self.assertEqual(_from_dict(data).agents[0].headers, {"X-Retries": "3"})
+
+    def test_a_non_string_value_is_fatal_only_under_strict(self):
+        """Where an operator asks for a warning to be fatal — `--strict-config`."""
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_headers({"X-Retries": 3}), strict=True)
+        self.assertIn("agent 'a' headers value for 'X-Retries'", str(ctx.exception))
+
+    def test_a_non_string_header_name_is_a_hard_error(self):
+        """A non-string key cannot be a header name, so it cannot be coerced.
+
+        tomllib never produces one — every TOML key, bare or quoted, parses to
+        `str`, so `3 = "premium"` is a *bare* key spelled `"3"` — which is why
+        this rule guards a config dict built in Python (an embedder calling
+        `validate_config` / `_from_dict` directly, or a test like this one)
+        rather than anything a written `jury.toml` can express.
+        """
+        self.assertEqual(list(tomllib.loads('[a]\n3 = "premium"\n')["a"]), ["3"])
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_headers({3: "premium"}))
+        self.assertIn("agent 'a' headers has a non-string header name", str(ctx.exception))
+
+    def test_the_offending_value_is_never_echoed_back(self):
+        """A header is where a credential lives; no message may carry one."""
+        secret = "Bearer sk-secret-42"
+        warnings = validate_config(self._with_headers({"Authorization": ["Bearer sk-secret-42"]}))
+        self.assertEqual(len(warnings), 1)
+        self.assertNotIn("sk-secret-42", warnings[0])
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(self._with_headers(f"Authorization = {secret}"))
+        self.assertNotIn("sk-secret-42", str(ctx.exception))
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict(self._with_headers(f"Authorization = {secret}"))
+        self.assertNotIn("sk-secret-42", str(ctx.exception))
+
+    def test_materialising_a_non_table_raises_the_config_error_not_an_attribute_error(self):
+        """The unvalidated path must fail as a config error, not a traceback.
+
+        `load_config` defaults to `validate=False` and `jury run-agent` keeps it
+        that way on purpose, so `_from_dict` is reached with a raw dict nothing
+        checked. Dropping the old `isinstance` guard would otherwise turn a
+        string `headers` into `'str' object has no attribute 'items'` there.
+        """
+        for value in ("Authorization = Bearer y", [["X-Route", "premium"]], 3):
+            with self.subTest(value=value), self.assertRaises(ConfigError) as ctx:
+                _from_dict(self._with_headers(value))
+            self.assertIn("agent 'a' headers must be a table", str(ctx.exception))
+
+    def test_materialising_a_non_string_key_raises_the_config_error(self):
+        """`_from_dict` classifies exactly as `validate_config` does."""
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict(self._with_headers({3: "premium"}))
+        self.assertIn("agent 'a' headers has a non-string header name", str(ctx.exception))
+
+    def test_an_unnamed_agent_is_still_located_in_the_message(self):
+        """`_from_dict` runs before `name` is read, so it falls back to the index."""
+        data = self._with_headers("nope")
+        del data["agent"][0]["name"]
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict(data)
+        self.assertIn("agent 'agent[0]' headers must be a table", str(ctx.exception))
+
+    def test_loading_an_unvalidated_file_reports_the_config_error(self):
+        """End-to-end on the default `load_config(validate=False)` path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jury.toml"
+            path.write_text(
+                '[jury]\nchair = "a"\n\n[[agent]]\nname = "a"\nvendor = "openai-compatible"\n'
+                'model = "m"\nheaders = "Authorization = Bearer y"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path)
+        self.assertIn("agent 'a' headers must be a table", str(ctx.exception))
+        self.assertIn("got str", str(ctx.exception))
+
+    def test_absent_headers_stay_an_empty_table(self):
+        data = self._with_headers({})
+        del data["agent"][0]["headers"]
+        self.assertEqual(validate_config(data), [])
+        self.assertEqual(_from_dict(data).agents[0].headers, {})
+
+    def test_headers_split_the_cache_key(self):
+        """Two seats differing only in a routing header are not the same run."""
+        premium = _from_dict(self._with_headers({"X-Route": "premium"}))
+        cheap = _from_dict(self._with_headers({"X-Route": "cheap"}))
+        none = _from_dict(self._with_headers({}))
+        self.assertNotEqual(config_hash(premium), config_hash(cheap))
+        self.assertNotEqual(config_hash(premium), config_hash(none))
+
+    def test_header_order_does_not_split_the_cache_key(self):
+        """The digest is a function of the mapping, not of how it was written."""
+        one = _from_dict(self._with_headers({"A": "1", "B": "2"}))
+        other = _from_dict(self._with_headers({"B": "2", "A": "1"}))
+        self.assertEqual(config_hash(one), config_hash(other))
+
+    def test_api_key_env_splits_the_cache_key(self):
+        """A different key can mean a different account, hence a different run."""
+        base = self._with_headers({})
+        first = dict(base, agent=[dict(base["agent"][0], api_key_env="ROUTER_A_KEY")])
+        second = dict(base, agent=[dict(base["agent"][0], api_key_env="ROUTER_B_KEY")])
+        self.assertNotEqual(config_hash(_from_dict(first)), config_hash(_from_dict(second)))
+        self.assertNotEqual(config_hash(_from_dict(first)), config_hash(_from_dict(base)))
 
 
 class SoftWarnings(unittest.TestCase):
@@ -271,6 +831,331 @@ class EndpointValidation(unittest.TestCase):
             w = validate_config(self._local("http://gpu-box.internal:8000/v1"))
         self.assertTrue(any("not loopback" in x for x in w), w)
         self.assertTrue(any("cleartext" in x or "plaintext" in x for x in w), w)
+
+
+class _RecordingTable(dict):
+    """A config table that records every key a ``*_from_dict`` reader asks for.
+
+    This is how the ``KNOWN_*_KEYS`` tuples are pinned to reality: they are
+    derived from the dataclass fields, but what an operator may legitimately
+    write is whatever the READER reads. Should a reader ever grow an alias (an
+    old key name kept working, say) the tuple would still list only the fields
+    and the alias would start warning as if it were a typo. Recording the reads
+    catches that divergence at the one place it can be seen.
+
+    **Two of these are never comparable, and saying so is the point** (#752).
+    ``dict.__eq__`` compares items, and the items here are always ``{}`` — the
+    recording is the entire content of the object, and it is exactly what
+    inherited equality cannot see. An ``assertEqual(table_a, table_b)`` written
+    expecting the recordings to be compared would therefore pass without
+    comparing them: a green assertion that asserts nothing, inside the one class
+    whose whole job is to catch a divergence. So ``==`` and ``!=`` both raise
+    rather than answering wrongly — compare ``.read``, the fact being recorded.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.read: set = set()
+
+    def get(self, key, default=None):
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.read.add(key)
+        return super().__getitem__(key)
+
+    def __eq__(self, other):
+        raise TypeError(
+            "_RecordingTable is a recorder, not a value, and cannot be compared "
+            f"with {type(other).__name__}: inherited dict equality compares the "
+            "(always empty) items and ignores what each table recorded. "
+            "Compare `.read` instead."
+        )
+
+    # `dict` answers `!=` itself — its `tp_richcompare` handles both directions
+    # — so `__ne__` does NOT fall back to the `__eq__` above, and an
+    # `assertNotEqual(table_a, table_b)` would still be answered on the (always
+    # empty) items. Refused explicitly, or only half the trap is closed.
+    __ne__ = __eq__
+
+    # Written out rather than left to the implicit `__hash__ = None` that
+    # defining `__eq__` produces: `dict` is already unhashable, so comparison was
+    # the only accident available here, and the pair belongs in one view.
+    __hash__ = None
+
+
+class NestedJuryTableUnknownKeys(unittest.TestCase):
+    """Issue #719: a typo inside `[jury.ci]`/`[jury.context]`/`[jury.diff]` warns.
+
+    The unknown-key check used to stop at the top level: `[jury] roundz` warned,
+    but `[jury.ci] min_vendor = 3` — the cross-vendor gate, one `s` short — was
+    read by nobody, dropped by `_ci_from_dict`, and passed `--config-validate
+    --strict-config` clean while the panel ran on the default of 2.
+    """
+
+    @staticmethod
+    def _with_nested(table, body):
+        return {
+            "jury": {"rounds": 1, "chair": "a", table: body},
+            "agent": [{"name": "a", "vendor": "anthropic", "command": "claude"}],
+        }
+
+    def test_ci_typo_warns_with_the_dotted_path(self):
+        # The reported reproduction: `min_vendors` minus its `s`.
+        w = validate_config(self._with_nested("ci", {"min_vendor": 3}))
+        self.assertEqual(len(w), 1, w)
+        self.assertIn("unknown key 'jury.ci.min_vendor'", w[0])
+        self.assertIn("min_vendors", w[0])
+
+    def test_context_typo_warns_with_the_dotted_path(self):
+        w = validate_config(self._with_nested("context", {"redact_secretz": False}))
+        self.assertEqual(len(w), 1, w)
+        self.assertIn("unknown key 'jury.context.redact_secretz'", w[0])
+        self.assertIn("redact_secrets", w[0])
+
+    def test_diff_typo_warns_with_the_dotted_path(self):
+        w = validate_config(self._with_nested("diff", {"max_bytez": 10}))
+        self.assertEqual(len(w), 1, w)
+        self.assertIn("unknown key 'jury.diff.max_bytez'", w[0])
+        self.assertIn("max_bytes", w[0])
+
+    def test_the_issue_reproduction_now_warns_once_per_typo(self):
+        data = {
+            "jury": {
+                "rounds": 1,
+                "chair": "a",
+                "ci": {"min_vendor": 3, "fail_onn": ["critical"]},
+                "context": {"redact_secretz": False},
+                "diff": {"max_bytez": 10},
+            },
+            "agent": [{"name": "a", "vendor": "anthropic", "command": "claude"}],
+        }
+        self.assertEqual(len(validate_config(data)), 4)
+
+    def test_strict_promotes_a_nested_typo_to_an_error(self):
+        for table, body in (
+            ("ci", {"min_vendor": 3}),
+            ("context", {"redact_secretz": False}),
+            ("diff", {"max_bytez": 10}),
+        ):
+            with self.subTest(table=table):
+                with self.assertRaises(ConfigError) as ctx:
+                    validate_config(self._with_nested(table, body), strict=True)
+                self.assertIn(f"jury.{table}.", str(ctx.exception))
+
+    def test_every_known_nested_key_is_accepted(self):
+        for table, keys in KNOWN_NESTED_JURY_KEYS.items():
+            with self.subTest(table=table):
+                # Values that pass the per-key shape rules; only the NAMES matter.
+                body = {key: [] if key in ("fail_on", "exclude", "include") else 1 for key in keys}
+                self.assertEqual(validate_config(self._with_nested(table, body)), [])
+
+    def test_an_empty_nested_table_is_accepted(self):
+        for table in KNOWN_NESTED_JURY_KEYS:
+            with self.subTest(table=table):
+                self.assertEqual(validate_config(self._with_nested(table, {})), [])
+
+    def test_a_non_table_is_a_hard_error_and_reports_no_unknown_keys(self):
+        # Every nested table is checked with the same wording (issue #729), and
+        # none of them is iterated for unknown keys: a string would otherwise
+        # report one unknown key per character.
+        for table, scalar in (
+            ("ci", "critical"),
+            ("context", "diff-only"),
+            ("diff", 4096),
+        ):
+            with self.subTest(table=table):
+                with self.assertRaises(ConfigError) as ctx:
+                    validate_config(self._with_nested(table, scalar))
+                message = str(ctx.exception)
+                self.assertIn(f"[jury.{table}] must be a table", message)
+                self.assertNotIn("unknown key", message)
+
+    def test_the_known_key_tuples_match_what_the_readers_read(self):
+        for reader, known in (
+            (_ci_from_dict, KNOWN_CI_KEYS),
+            (_context_from_dict, KNOWN_CONTEXT_KEYS),
+            (_diff_from_dict, KNOWN_DIFF_KEYS),
+        ):
+            with self.subTest(reader=reader.__name__):
+                table = _RecordingTable()
+                reader(table)
+                self.assertEqual(table.read, set(known))
+
+    def test_a_recording_table_refuses_to_be_compared(self):
+        """The assertion the class invites, and cannot honour, fails loudly (#752).
+
+        Every `_RecordingTable` holds the same items — none — so inherited
+        `dict` equality calls any two of them equal however differently they
+        were read, and calls each one equal to `{}`. Someone reaching for
+        `assertEqual(table_a, table_b)` to compare the recordings would get a
+        green assertion that compared nothing, in the one class whose whole job
+        is to catch a divergence. `.read` is the comparable half.
+        """
+        ci, diff = _RecordingTable(), _RecordingTable()
+        _ci_from_dict(ci)
+        _diff_from_dict(diff)
+        # Different recordings, identical (empty) items: the trap in one line.
+        self.assertNotEqual(ci.read, diff.read)
+        self.assertEqual(dict(ci), dict(diff))
+        for other in (diff, {}, object()):
+            with self.subTest(other=type(other).__name__):
+                with self.assertRaises(TypeError) as caught:
+                    _ = ci == other
+                self.assertIn("recorder, not a value", str(caught.exception))
+                # `dict` answers `!=` without consulting `__eq__`, so the
+                # mirror accident is refused by its own binding, not for free.
+                with self.assertRaises(TypeError):
+                    _ = ci != other
+
+    def test_the_tables_are_exactly_the_nested_ones_jury_reads(self):
+        # Every other `KNOWN_JURY_KEYS` member is a scalar, so this dict is the
+        # complete set of sub-tables a typo could disappear into.
+        defaults = _from_dict({"jury": {}, "agent": []})
+        nested = {
+            name
+            for name in KNOWN_JURY_KEYS
+            if hasattr(getattr(defaults, name, None), "__dataclass_fields__")
+        }
+        self.assertEqual(nested, set(KNOWN_NESTED_JURY_KEYS))
+
+
+class NestedTableShapeOnTheUnvalidatedPath(unittest.TestCase):
+    """A scalar `[jury.*]` is a `ConfigError` in the readers too (issue #729).
+
+    `validate_config` is not on every path to a `JuryConfig`: `load_config`
+    defaults to `validate=False`, and `jury run-agent` keeps it that way on
+    purpose so one seat's (or one table's) mistake cannot stop a single-seat
+    run. Before this, `context = "diff-only"` reached `_context_from_dict` and
+    raised `'str' object has no attribute 'get'` — a traceback rather than the
+    message the caller already knows how to print. `ci` and `diff` had the same
+    hole; the fix is the same in all three, with the wording `validate_config`
+    uses.
+    """
+
+    _SCALARS = (("ci", "critical"), ("context", "diff-only"), ("diff", 4096))
+
+    _READERS = {"ci": _ci_from_dict, "context": _context_from_dict, "diff": _diff_from_dict}
+
+    def test_each_reader_rejects_a_scalar_with_the_shared_message(self):
+        for table, scalar in self._SCALARS:
+            reader = self._READERS[table]
+            with self.subTest(table=table):
+                with self.assertRaises(ConfigError) as ctx:
+                    reader(scalar)
+                self.assertIn(f"[jury.{table}] must be a table", str(ctx.exception))
+
+    def test_from_dict_raises_config_error_not_attribute_error(self):
+        for table, scalar in self._SCALARS:
+            with self.subTest(table=table):
+                data = {
+                    "jury": {"chair": "a", table: scalar},
+                    "agent": [{"name": "a", "vendor": "anthropic", "command": "claude"}],
+                }
+                with self.assertRaises(ConfigError) as ctx:
+                    _from_dict(data)
+                self.assertIn(f"[jury.{table}] must be a table", str(ctx.exception))
+
+    def test_a_well_formed_nested_table_still_materialises(self):
+        cfg = _from_dict(
+            {
+                "jury": {
+                    "chair": "a",
+                    "ci": {"min_vendors": 1},
+                    "context": {"mode": "expanded"},
+                    "diff": {"max_bytes": 4096},
+                },
+                "agent": [{"name": "a", "vendor": "anthropic", "command": "claude"}],
+            }
+        )
+        self.assertEqual(cfg.ci.min_vendors, 1)
+        self.assertEqual(cfg.context.mode, "expanded")
+        self.assertEqual(cfg.diff.max_bytes, 4096)
+
+
+#: `jury.toml` examples live in these two docs; both are copy-pasted by readers.
+_DOCS_WITH_JURY_TOML = ("configuration.md", "parameters.md")
+_TOML_FENCE_RE = re.compile(r"```toml\n(.*?)```", re.DOTALL)
+#: A documented `[jury…]` fragment rarely declares its own panel; supply one so
+#: the block is judged on its own keys, not on "no agents configured".
+_STAND_IN_AGENT = {"name": "claude", "vendor": "anthropic", "command": "claude"}
+
+
+def _documented_jury_blocks() -> list:
+    """Every fenced ```toml block in the docs that configures a `[jury…]` table."""
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    blocks = []
+    for name in _DOCS_WITH_JURY_TOML:
+        text = (docs / name).read_text(encoding="utf-8")
+        for index, match in enumerate(_TOML_FENCE_RE.finditer(text)):
+            body = match.group(1)
+            if "[jury" in body:
+                blocks.append((f"{name} toml block #{index}", body))
+    return blocks
+
+
+class TopLevelTableShapeOnTheUnvalidatedPath(unittest.TestCase):
+    """A scalar `jury` or a malformed `agent` is a `ConfigError` in `_from_dict` too (#732).
+
+    #731 closed the nested tables; the top level had the same hole one level up.
+    `validate_config` already refused these shapes — the reader did not, and the
+    non-validating callers only handle `ConfigError`.
+    """
+
+    _AGENT = {"name": "a", "vendor": "anthropic", "command": "claude"}
+
+    def test_a_scalar_jury_is_a_config_error_not_an_attribute_error(self):
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict({"jury": "x", "agent": [self._AGENT]})
+        self.assertEqual(str(ctx.exception), "[jury] must be a table.")
+
+    def test_a_scalar_agent_is_a_config_error(self):
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict({"jury": {}, "agent": "claude"})
+        self.assertEqual(str(ctx.exception), "[[agent]] must be an array of tables.")
+
+    def test_an_agent_entry_that_is_not_a_table_is_a_config_error_naming_its_index(self):
+        with self.assertRaises(ConfigError) as ctx:
+            _from_dict({"jury": {}, "agent": [self._AGENT, "codex"]})
+        self.assertEqual(str(ctx.exception), "agent[1] must be a table.")
+
+    def test_the_reader_and_the_validator_say_the_same_thing(self):
+        for data in (
+            {"jury": "x", "agent": [self._AGENT]},
+            {"jury": {}, "agent": "claude"},
+        ):
+            with self.subTest(data=data):
+                with self.assertRaises(ConfigError) as validated:
+                    validate_config(data)
+                with self.assertRaises(ConfigError) as materialised:
+                    _from_dict(data)
+                self.assertEqual(str(validated.exception), str(materialised.exception))
+
+
+class DocumentedExamplesAreStrictClean(unittest.TestCase):
+    """Every documented `[jury…]` example survives `--strict-config` (#719).
+
+    Nested-table validation is only safe to add if the documentation is not
+    itself teaching keys the validator will now reject, and the check is worth
+    keeping afterwards: a doc that drifts from the schema hands the reader a
+    config that fails the very gate the doc told them to run.
+    """
+
+    def test_the_docs_contain_jury_examples_to_check(self):
+        # Guard the regex itself: silently matching nothing would make the
+        # assertion below vacuous.
+        blocks = _documented_jury_blocks()
+        self.assertTrue(blocks)
+        for name in _DOCS_WITH_JURY_TOML:
+            self.assertTrue(any(label.startswith(name) for label, _ in blocks), name)
+
+    def test_every_documented_jury_block_validates_under_strict(self):
+        for label, body in _documented_jury_blocks():
+            with self.subTest(block=label):
+                data = tomllib.loads(body)
+                data.setdefault("agent", [dict(_STAND_IN_AGENT)])
+                self.assertEqual(validate_config(data, strict=True), [])
 
 
 if __name__ == "__main__":

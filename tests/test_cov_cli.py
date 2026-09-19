@@ -126,7 +126,10 @@ class InitDetectionPaths(unittest.TestCase):
 
     def test_init_available_swallows_errors(self):
         # _init_available: make_adapter raising -> detection records False (312-313).
-        with mock.patch("ai_jury.adapters.make_adapter", side_effect=RuntimeError("boom")):
+        # Patched in the cli namespace: make_adapter is imported at module level
+        # there now (the effort warnings need it), so the adapters-module name is
+        # no longer the one this function resolves.
+        with mock.patch("ai_jury.cli.make_adapter", side_effect=RuntimeError("boom")):
             avail = cli._init_available()
         self.assertTrue(all(v is False for v in avail.values()))
 
@@ -192,7 +195,7 @@ class InitInteractive(unittest.TestCase):
     def test_default_models_fn_used(self):
         # models_fn left None -> imports list_local_models (line 327). Choose qwen
         # so the local-model block runs; empty pick -> local_model = default (365).
-        answers = iter(["qwen", "", "", "", ""])  # agents, rounds, chair, verify, model pick
+        answers = iter(["qwen", "", "", "", "", ""])  # agents/rounds/chair/verify/model/effort
 
         def fake_input(_prompt):
             return next(answers)
@@ -375,7 +378,7 @@ class IncrementalAndGuards(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         self.diff = self.d / "x.diff"
-        self.diff.write_text(DIFF)
+        self.diff.write_text(DIFF, encoding="utf-8")
 
     def test_incremental_requires_pr(self):
         # 784: --incremental without --pr raises SystemExit with the message as code.
@@ -420,7 +423,7 @@ class AutoDepthBranches(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         self.diff = self.d / "x.diff"
-        self.diff.write_text(DIFF)
+        self.diff.write_text(DIFF, encoding="utf-8")
 
     def test_auto_with_explicit_rounds_and_verify(self):
         # --rounds given -> skip the rounds override (813->815 false);
@@ -455,7 +458,7 @@ class CiAndPatchesBranches(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         self.diff = self.d / "x.diff"
-        self.diff.write_text(DIFF)
+        self.diff.write_text(DIFF, encoding="utf-8")
 
     def test_ci_json_skips_gate_section(self):
         # --ci with non-markdown format: the CI gate section is not appended
@@ -492,7 +495,7 @@ class InitInteractiveModelPicks(unittest.TestCase):
     unreachable-server fallback prompt (367-371)."""
 
     def test_pick_model_by_number(self):
-        answers = iter(["qwen", "1", "qwen", "y", "2"])  # last: pick model #2
+        answers = iter(["qwen", "1", "qwen", "y", "2", ""])  # pick model #2, then skip effort
 
         def fake_input(_prompt):
             return next(answers)
@@ -505,7 +508,7 @@ class InitInteractiveModelPicks(unittest.TestCase):
         self.assertEqual(kwargs["local_model"], "b:2b")
 
     def test_pick_model_by_name(self):
-        answers = iter(["qwen", "1", "qwen", "y", "custom:3b"])
+        answers = iter(["qwen", "1", "qwen", "y", "custom:3b", ""])
 
         def fake_input(_prompt):
             return next(answers)
@@ -519,7 +522,7 @@ class InitInteractiveModelPicks(unittest.TestCase):
 
     def test_server_unreachable_fallback_prompt(self):
         # No models discoverable -> the "could not reach server" prompt (367-371).
-        answers = iter(["qwen", "1", "qwen", "y", "mymodel:1b"])
+        answers = iter(["qwen", "1", "qwen", "y", "mymodel:1b", ""])
 
         def fake_input(_prompt):
             return next(answers)
@@ -568,7 +571,7 @@ class ConfigShowError(unittest.TestCase):
     def test_config_show_invalid_file(self):
         # _run_config load error (564-566).
         cfg = Path(tempfile.mkdtemp()) / "bad.toml"
-        cfg.write_text("[jury]\nrounds = 0\n")
+        cfg.write_text("[jury]\nrounds = 0\n", encoding="utf-8")
         code, _, err = run(["config", "show", "--config", str(cfg)])
         self.assertEqual(code, 2)
         self.assertIn("error:", err)
@@ -578,7 +581,7 @@ class PolicyAndPostGuards(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         self.diff = self.d / "x.diff"
-        self.diff.write_text(DIFF)
+        self.diff.write_text(DIFF, encoding="utf-8")
 
     def test_policy_load_error(self):
         # load_policy raising PolicyError -> exit 2 (748-750).
@@ -628,7 +631,7 @@ class PolicyAndPostGuards(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertTrue(outp.exists())
-        self.assertIn("Suggested patches", outp.read_text())
+        self.assertIn("Suggested patches", outp.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

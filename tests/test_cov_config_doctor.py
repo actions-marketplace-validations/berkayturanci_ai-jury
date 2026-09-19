@@ -185,13 +185,26 @@ class DoctorWarningBranches(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
 
-    def test_no_agents_configured_warning(self):
-        # doctor.py:107 — empty [[agent]] list -> "no agents are configured".
+    def test_no_agents_configured_is_the_doctor_verdict(self):
+        # An empty [[agent]] list is a HARD config error, and the doctor now
+        # loads WITH validation (#708), so it reports the refusal a run gives
+        # instead of describing a bench that cannot exist.
         cfg = self.d / "jury.toml"
-        cfg.write_text('[jury]\nrounds = 1\nchair = "a"\n')
-        # load_config tolerates an empty agent list (validate is off in doctor).
+        cfg.write_text('[jury]\nrounds = 1\nchair = "a"\n', encoding="utf-8")
         diag = doctor.build_diagnostics(str(cfg))
-        self.assertIn("no agents are configured", diag["config_warnings"])
+        self.assertIsNone(diag["config"])
+        self.assertTrue(
+            any("no agents configured" in w for w in diag["config_warnings"]),
+            diag["config_warnings"],
+        )
+        self.assertFalse(diag["recommendations"]["ready"])
+
+    def test_no_agents_detect_warning_branch(self):
+        # doctor.py:245-246 — the branch itself, now reachable only when a
+        # `JuryConfig` is handed in directly; validation no longer lets an
+        # agent-less config through `build_diagnostics`.
+        empty = cfgmod._from_dict({"jury": {"rounds": 1}, "agent": []})
+        self.assertIn("no agents are configured", doctor._detect_warnings(empty))
 
     def test_local_agent_unreachable_endpoint_warning(self):
         # doctor.py:119-120 — enabled local agent whose endpoint is unreachable.
@@ -199,7 +212,8 @@ class DoctorWarningBranches(unittest.TestCase):
         cfg.write_text(
             '[jury]\nrounds = 1\nchair = "q"\n\n'
             '[[agent]]\nname = "q"\nvendor = "local"\nmodel = "m"\n'
-            'endpoint = "http://localhost:11434/v1"\n'
+            'endpoint = "http://localhost:11434/v1"\n',
+            encoding="utf-8",
         )
         with mock.patch("ai_jury.doctor._is_available", return_value=False):
             diag = doctor.build_diagnostics(str(cfg))
@@ -212,7 +226,8 @@ class DoctorWarningBranches(unittest.TestCase):
         cfg = self.d / "jury.toml"
         cfg.write_text(
             '[jury]\nrounds = 1\nchair = "a"\n\n'
-            '[[agent]]\nname = "a"\nvendor = "anthropic"\ncommand = "ghost-cli"\n'
+            '[[agent]]\nname = "a"\nvendor = "anthropic"\ncommand = "ghost-cli"\n',
+            encoding="utf-8",
         )
         with mock.patch("ai_jury.doctor._is_available", return_value=False):
             diag = doctor.build_diagnostics(str(cfg))
@@ -221,11 +236,34 @@ class DoctorWarningBranches(unittest.TestCase):
             diag["config_warnings"],
         )
 
-    def test_keyerror_config_captured(self):
-        # doctor.py:199-200 — an agent table missing "name" makes _from_dict
-        # raise KeyError, which build_diagnostics catches into config_warnings.
+    def test_materialisation_error_captured(self):
+        # The (KeyError, ValueError, TypeError) arm. Since the doctor validates
+        # (#708) no shipped config reaches it — validation names a missing agent
+        # `name` or a non-numeric `timeout` first — but it stays as the guard on
+        # `build_diagnostics`' promise never to raise, so it is exercised at the
+        # seam it guards.
         cfg = self.d / "jury.toml"
-        cfg.write_text('[jury]\nrounds = 1\n\n[[agent]]\nvendor = "anthropic"\ncommand = "x"\n')
+        cfg.write_text(
+            '[jury]\nrounds = 1\n\n[[agent]]\nname = "a"\ncommand = "x"\n', encoding="utf-8"
+        )
+        with mock.patch("ai_jury.doctor.load_config", side_effect=ValueError("boom")):
+            diag = doctor.build_diagnostics(str(cfg))
+        self.assertIsNone(diag["config"])
+        self.assertTrue(
+            any(w.startswith("config error:") for w in diag["config_warnings"]),
+            diag["config_warnings"],
+        )
+        self.assertFalse(diag["recommendations"]["ready"])
+
+    def test_keyerror_config_captured(self):
+        # An agent table missing "name" is a hard validation error, so the
+        # doctor reports the same refusal a run gives (#708) rather than a
+        # KeyError out of `_from_dict`.
+        cfg = self.d / "jury.toml"
+        cfg.write_text(
+            '[jury]\nrounds = 1\n\n[[agent]]\nvendor = "anthropic"\ncommand = "x"\n',
+            encoding="utf-8",
+        )
         diag = doctor.build_diagnostics(str(cfg))
         self.assertIsNone(diag["config"])
         self.assertTrue(

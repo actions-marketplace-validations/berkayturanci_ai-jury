@@ -1471,7 +1471,7 @@
         logo: "logos/githubactions.svg",
         color: "#ffffff",
         desc: "Official composite GitHub Action for automated PR reviews and sticky comments.",
-        config: "- uses: berkayturanci/ai-jury@v1\n  with:\n    pr: ${{ github.event.pull_request.number }}\n    post-summary: 'true'\n    fail-on: 'critical,major'",
+        config: "- uses: berkayturanci/ai-jury@v1\n  with:\n    openai-api-key: ${{ secrets.OPENAI_API_KEY }}\n    args: '--auto --post --ci --fail-on critical,major'",
         command: "gh workflow run jury.yml"
       },
       {
@@ -1485,7 +1485,7 @@
         logo: "logos/precommit.svg",
         color: "#10b981",
         desc: "Run consensus verification locally before commits or git pushes.",
-        config: "# .pre-commit-config.yaml\nrepos:\n  - repo: https://github.com/berkayturanci/ai-jury\n    rev: v1.15.1\n    hooks:\n      - id: ai-jury\n        stages: [pre-push]",
+        config: "# .pre-commit-config.yaml\nrepos:\n  - repo: https://github.com/berkayturanci/ai-jury\n    rev: v1.18.1\n    hooks:\n      - id: ai-jury\n        stages: [pre-push]",
         command: "git push"
       },
       {
@@ -1498,7 +1498,7 @@
         iconKey: "claude",
         logo: "logos/claude.svg",
         color: "var(--c-claude)",
-        desc: "First-class Claude Code plugin and skill for direct chat reviews.",
+        desc: "First-class Claude Code plugin and skill for direct chat reviews. Updating is not a re-install.",
         config: "# .claude-plugin/plugin.json\n{\n  \"name\": \"ai-jury\",\n  \"description\": \"Multi-agent review jury\"\n}",
         command: "/jury review"
       },
@@ -1582,8 +1582,20 @@
       if (filtered.length === 0) {
         grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 3rem 1rem; color: var(--muted);">' +
           '<p style="font-size: 1.1rem; margin-bottom: 0.5rem;">No integrations found matching "' + esc(query) + '"</p>' +
-          '<p style="font-size: 0.85rem; color: var(--faint);">Try searching for Claude, Codex, Gemini, Ollama, or GitHub Actions.</p>' +
+          '<p style="font-size: 0.85rem; color: var(--faint); margin-bottom: 1.5rem;">Try searching for Claude, Codex, Gemini, Ollama, or GitHub Actions.</p>' +
+          '<button type="button" class="btn ghost" id="int-clear-search">Clear search</button>' +
           '</div>';
+        var clearBtn = $("int-clear-search");
+        if (clearBtn) {
+          clearBtn.addEventListener("click", function () {
+            if (searchInput) {
+              searchInput.value = "";
+              query = "";
+              renderCards();
+              searchInput.focus();
+            }
+          });
+        }
         return;
       }
 

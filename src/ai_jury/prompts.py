@@ -30,7 +30,17 @@ import re
 # heavy-ornament, much-less/greater, Canadian-syllabic, guillemet forms).
 # v6: add vertical presentation-form angle brackets (U+FE3D-FE40) for parity
 # with the already-covered CJK angle brackets (second red-team pass).
-PROMPT_VERSION = 6
+# v7 (issue #700): the review templates ask for a leading `Checked:` / `Tested:`
+# pair. A ballot's `scope` and `testing` used to be *inferred* from whatever
+# coverage-shaped prose happened to be in the reply, so a reviewer that named
+# nothing produced a placeholder scope and "not stated" — the least checkable
+# evidence in the run. Asking the reviewer to state its own coverage beats this
+# tool guessing at it, and a reply that still names nothing now abstains.
+# v8 (issue #710): the code-review template says that every name on the
+# `Checked:` line is resolved against the diff, and that a line resolving to
+# nothing abstains. The rule changed — `Checked: nothing` used to satisfy it —
+# and a reviewer held to a rule the prompt does not state is a trap.
+PROMPT_VERSION = 8
 
 
 # Neutralize sentinel fences inside untrusted content (issue #301). Every fence
@@ -138,6 +148,15 @@ Focus, in priority order:
 4. Missing tests for risky paths
 
 Rules:
+- Open your reply with exactly these two lines, before anything else:
+  Checked: <the files, paths or symbols you actually read, comma-separated>
+  Tested: <the commands you ran and what they showed, or "nothing run" if you ran none>
+  They are recorded verbatim as this ballot's scope and testing evidence. Every
+  name on the Checked line is resolved against the diff above: a path, a
+  path:line, or a symbol that appears in it. "nothing", "everything" and "the
+  diff" name none of those. A ballot whose Checked line resolves to nothing is
+  recorded as an ABSTENTION, not an approval — so name what you read even when
+  you found nothing wrong.
 - Be specific: cite `path:line` for every finding.
 - Only report issues you are genuinely confident about. No style nitpicks unless
   they cause real harm.
@@ -326,6 +345,12 @@ Assess, in priority order:
 5. Clarity / actionability — unambiguous, self-contained, ready to pick up?
 
 Rules:
+- Open your reply with exactly these two lines, before anything else:
+  Checked: <the issue sections, fields or linked artifacts you actually read>
+  Tested: <anything you ran to confirm a gap, or "nothing run" if you ran none>
+  They are recorded verbatim as this ballot's scope and testing evidence. A
+  ballot that names nothing checkable is recorded as an ABSTENTION, not a
+  clean triage — so name what you read even when you found no gaps.
 - Each finding is a GAP in the issue (something missing, vague, or contradictory).
 - Be specific about WHAT is missing and WHY it blocks triage.
 - If the issue is genuinely complete and clear, say exactly: "No gaps found."

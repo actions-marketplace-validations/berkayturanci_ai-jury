@@ -5,12 +5,22 @@ what supply-chain metadata ships with them, and how to verify a release (issue
 #25). Releases are cut by pushing a `v*` tag, which triggers
 [`.github/workflows/publish.yml`](../.github/workflows/publish.yml).
 
+For *why* the Homebrew half of the chain is shaped the way it is — why no formula
+is committed to this repository, and what each guard catches — see
+[The Homebrew release chain](homebrew-release-chain.md).
+
 ## What a release contains
 
 For each release, the publish workflow builds and attaches:
 
 - **`*.whl` and `*.tar.gz`** — the wheel and sdist, built with `python -m build`.
-- **`SHA256SUMS`** — SHA-256 checksums over every artifact (including the SBOM).
+- **`ai-jury.rb`** — the Homebrew formula, rendered from
+  `packaging/homebrew/ai-jury.rb.template` with the url and SHA-256 digest PyPI
+  reports for the sdist that was just uploaded. Always available at
+  `https://github.com/berkayturanci/ai-jury/releases/latest/download/ai-jury.rb`,
+  which is how the tap gets it without a credential at either end.
+- **`SHA256SUMS`** — SHA-256 checksums over every artifact (including the SBOM
+  and the formula).
 - **`sbom.cdx.json`** — a [CycloneDX](https://cyclonedx.org/) software bill of
   materials. The project has **zero runtime dependencies**, so the SBOM is small
   by design; it is generated on every release rather than deferred.
@@ -23,8 +33,60 @@ For each release, the publish workflow builds and attaches:
 1. A maintainer pushes a `v<version>` tag (see [release-checklist](release-checklist.md)).
 2. The workflow checks out the tag, builds the sdist + wheel on a pinned Python,
    generates the SBOM and `SHA256SUMS`, attests build provenance, publishes to
-   PyPI via **trusted publishing**, and creates the GitHub Release with all
-   assets attached.
+   PyPI via **trusted publishing**, renders the Homebrew formula from what PyPI
+   reports, and creates the GitHub Release with all assets attached.
+3. A second job, `verify`, then installs the *published* release the way a user
+   would — a clean virtualenv, `pip install ai-jury==<version>` from the index —
+   and checks that `jury --version` equals the tag, that `jury --doctor` runs,
+   and that the digest the Homebrew tap tells `brew` to expect is the digest of
+   the sdist PyPI serves. It opens (or comments on) a `release-broken: <tag>`
+   issue when any of that fails, because a red workflow nobody is watching is
+   how six of the last seven releases went out broken.
+
+Nothing after the tag commits to this repository. A release is exactly one write
+to `main`: the release pull request.
+
+Uploading to PyPI is synchronous; being indexed by it is not, and the formula is
+rendered from the *published* sdist — a read-after-write against a service that
+is only eventually consistent. Both jobs therefore run one shared wait,
+`.github/scripts/wait-for-pypi-dists.sh`, which polls
+`https://pypi.org/pypi/ai-jury/<version>/json` for five minutes (30 × 10s) until
+**both** distributions appear in its `urls` array, and hands back the sdist's own
+url and sha256. The five minutes is a ceiling and not an estimate: every request
+carries a connect timeout and a maximum time, and the poll stops once the budget
+is spent, so a response that stalls after the connection is accepted cannot hold
+the step open. Before #694 the render waited only for that endpoint to answer at
+all: on v1.16.0 it answered with an empty file list, the read raised
+`StopIteration`, and `curl` was handed an empty url — failing *after* the upload
+and *before* the GitHub Release, which left 1.16.0 live on PyPI with no release
+and no `releases/latest/download/ai-jury.rb`. If the index genuinely never
+converges the job now fails with an `::error::` naming the version and the
+distribution that never appeared; re-running the job is the recovery, and
+`skip-existing: true` keeps the upload step a no-op.
+
+The same rule covers every other command in that workflow that opens a
+connection, because the index converging is not the file server answering: the
+sdist downloads carry `--connect-timeout` and `--max-time`
+(`SDIST_CONNECT_TIMEOUT`/`SDIST_MAX_TIME`, 10s and 120s by default), and every
+`pip install` and every `gh` call is wrapped in `timeout`. `gh` accepts no other
+bound at all; `pip` appears to, but its `--timeout` limits one quiet read rather
+than the call, so a peer that sends a byte inside every window is unbounded by
+it. The wrapper is the only bound that is both real and countable here. `0` is refused for either sdist timeout rather than
+passed on, because `${SDIST_MAX_TIME:-120}` substitutes only when the variable is
+unset or empty and curl reads `0` as "no limit" — the unbounded download, reached
+through the bound.
+
+Underneath them all three jobs set `timeout-minutes` — 30 for the publish job, 45
+for `verify`, 10 for the alias move — which bounds the actions the workflow
+`uses:` and anything a future step forgets to bound. That ceiling is a backstop and not the mechanism: a job
+stopped by `timeout-minutes` is cancelled, so `verify`'s failure step does not
+run and no `release-broken` issue is opened, whereas a command that fails on its
+own timeout fails the job and files the report. It must therefore sit *above*
+the sum of the bounds beneath it — `verify` may spend about 2580s inside its own
+waits and its failure report, so twenty minutes would have cancelled a job that
+was still inside every deadline it sets itself.
+`tests/test_publish_release_chain.py` recomputes that sum from the workflow, for
+every job the file declares, so neither a new wait nor a new job escapes it.
 
 All GitHub Actions are pinned to full commit SHAs (see
 [CONTRIBUTING](../CONTRIBUTING.md)).
@@ -33,10 +95,36 @@ All GitHub Actions are pinned to full commit SHAs (see
 
 Publishing uses [PyPI trusted publishing](https://docs.pypi.org/trusted-publishers/)
 (OIDC) instead of a long-lived API token. This required a **one-time** setup on
-PyPI — a trusted publisher for this repository and the `publish.yml` workflow — which
-is now configured (v1.0.0 and v1.1.0 were published this way). The publish step is
-**not** `continue-on-error`: a failed upload fails the release loudly so a broken
-publish can't pass silently. `skip-existing` keeps re-runs idempotent.
+PyPI — a trusted publisher for this repository and the `publish.yml` workflow —
+which is now configured and used by every release. The publish step is **not**
+`continue-on-error`: a failed upload fails the release loudly so a broken publish
+can't pass silently. `skip-existing` keeps re-runs idempotent.
+
+## Which files carry the version
+
+One table, [`scripts/release_surfaces.py`](../scripts/release_surfaces.py), lists
+every file that names the release — package metadata, `uv.lock`, both plugin
+manifests, the website, the README, and the cookbook — together with the pattern
+that reads the version out of each.
+
+The Homebrew formula is not on that list, and its absence is deliberate: #666
+deleted `Formula/ai-jury.rb` rather than keep repairing a file whose url and
+digest cannot be known before the tag. What is left is
+`packaging/homebrew/ai-jury.rb.template`, which names `@VERSION@` until the
+release renders it — a placeholder cannot go stale, so nothing needs to watch it.
+
+Three guards read that table, and none of them keeps its own copy:
+
+| Guard | Question it asks |
+| --- | --- |
+| `scripts/verify_merge.py --check-version` (CI, `fetch-depth: 0`) | Do the surfaces present agree, and has the version not gone backwards from the last `v*` tag? |
+| `scripts/verify_merge.py --check-surfaces` (`make release-check`) | Does **every** listed surface name what `pyproject.toml` declares? |
+| `tests/test_release_metadata.py` | The same question, in the unit suite, on every pull request. |
+
+Registering a new surface is one line in that table (#665). It used to be three
+lines in three files, and the surface that was missed is the one that went stale:
+`website/index.html` and `website/app.js` sat at v1.14.4 through two releases
+(#646).
 
 ## Semantic Versioning (SemVer 2.0.0) Policy
 
@@ -66,8 +154,37 @@ Every release is automatically published across three primary distribution chann
 2. **GitHub Releases & GitHub Action Marketplace**:
    - Automated via `publish.yml` using `softprops/action-gh-release`.
    - GitHub Action is consumable as `uses: berkayturanci/ai-jury@v1` or pinned to release tags.
+   - `v1` is a moving alias, and `publish.yml`'s `major-tag` job is what moves it.
+     It runs **after** `verify`, so the alias only ever advances to a release that
+     has been installed from the index and run; a release that fails verification
+     leaves `v1` on the last one that worked. It moves forward only — a re-tag of
+     an older release is refused rather than handed to every consumer as a silent
+     downgrade — and a prerelease tag (`v2.0.0rc1`) does not move it at all.
+     The ref is written with `GITHUB_TOKEN` on purpose: a ref written with that
+     token starts no workflow run, and `v1` would otherwise match this workflow's
+     own `v*` trigger. A **hand**-created or hand-moved alias does start one, so
+     the trigger also subtracts bare `v<digits>` with a negative pattern.
+   - **The pattern protects the ref it is on, not the ref that is pushed.** GitHub
+     reads a push event's workflow definition from the pushed ref, so what governs
+     is the copy of `publish.yml` in the commit the alias points at. Bootstrapping
+     `v1` against `v1.17.1` — a release cut before the pattern existed — therefore
+     ran the `v*` trigger as it stood *there* and failed the version guard with
+     `tag (1) must match pyproject (1.17.1)`. Nothing was built or published: it
+     fails on the first real step, `verify` is skipped, and no `release-broken`
+     issue is filed.
+     **This does not recur, `v2` included.** The automated move writes the ref
+     with `GITHUB_TOKEN` and starts no run at all, and a hand-push of `v2` aims at
+     `v2.0.0`, whose tree carries the pattern. A red `publish.yml` run on an alias
+     is therefore a real failure to read, not an expected artifact — the only way
+     to reproduce the bootstrap is to aim an alias at a commit older than the
+     pattern itself.
+   - Until #781 this line was false. Three documents told consumers to write
+     `@v1` and no `refs/tags/v1` existed, so the documented way in was the one
+     that did not resolve. `tests/test_publish_release_chain.py` now reads every
+     `uses: berkayturanci/ai-jury@<ref>` out of the tree and refuses any ref the
+     release flow does not maintain.
 3. **Homebrew Tap (`berkayturanci/homebrew-ai-jury`)**:
-   - Automated formula synchronization: `publish.yml` queries PyPI for the uploaded sdist's immutable URL and SHA-256 digest, updates `Formula/ai-jury.rb`, and syncs to `berkayturanci/homebrew-ai-jury`.
+   - No formula is committed to this repository. `publish.yml` queries PyPI for the uploaded sdist's immutable URL and SHA-256 digest, renders `packaging/homebrew/ai-jury.rb.template`, attaches the result to the GitHub Release, and pushes it to `berkayturanci/homebrew-ai-jury` when `HOMEBREW_TAP_TOKEN` is set.
    - Installable via `brew install berkayturanci/ai-jury/ai-jury` or `brew install ai-jury`.
 
 ## How to verify a release

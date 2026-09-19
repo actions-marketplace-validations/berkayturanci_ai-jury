@@ -197,7 +197,11 @@ marketplace):
 /plugin install ai-jury@ai-jury
 ```
 
-Or drop [`skill/ai-jury/`](../skill/ai-jury/SKILL.md) into a
+That is Claude Code's short form. The CLI commands, the other three agents, and —
+the part `/plugin install` cannot do, because it is a no-op on an installed
+plugin — **updating**, are in [install.md](install.md).
+
+Or drop [`skills/ai-jury/`](../skills/ai-jury/SKILL.md) into a
 project's `.claude/skills/` directory manually.
 
 Then ask the assistant for a review, e.g.:
@@ -331,6 +335,90 @@ trialing the tool with one CLI.
 > two or three *different* vendors catch more than one reviewer run repeatedly.
 > Trimming to one agent is fine for smoke tests and cost control, but use ≥2
 > vendors when you want the real jury effect.
+
+### Proving the panel did not collapse
+
+Configuring three vendors is not the same as *hearing from* three. An agent can
+be on `PATH`, pass its version probe, be reported `[available]` by `jury
+--doctor`, and still contribute nothing — a refusal, a CLI whose flags changed
+under it, a reply with no findings block. The run continues (fail-soft), and its
+report looks exactly like a healthy one.
+
+Two things stop that being silent.
+
+**Before the run — `jury --doctor`.** The report ends with a readiness block, and
+`--doctor --json` carries the same facts under `panel`:
+
+```console
+$ jury --doctor
+...
+Cross-vendor readiness
+----------------------------------------
+  vendors enabled:   3
+  vendors reachable: 1
+  min_vendors gate:  2
+  cross-vendor ready: no
+  note: this checks availability, not contribution. A reachable CLI can still
+        return no review (#635) — only a run can prove the panel.
+```
+
+```bash
+jury --doctor --json | jq '.panel'
+# { "vendors_configured": 3, "vendors_available": 1, "min_vendors": 2,
+#   "contributing_vendors": null, "multi_vendor_ready": false }
+```
+
+`contributing_vendors` is `null` on purpose: doctor runs no review, so it can
+only report reachability. Do not read a green doctor as proof of a cross-vendor
+panel.
+
+**After the run — the `--min-vendors` guard**, which counts vendors that actually
+**contributed a review** and exits **3** when there are too few:
+
+```bash
+jury --pr 123 --ci                     # guard on by default (min_vendors = 2)
+jury --pr 123 --min-vendors 3          # require all three vendors
+jury --pr 123 --no-min-vendors         # accept a collapsed panel (explicit)
+```
+
+**From this release the gate is on by default, and it scopes on the vendors your
+config NAMES.** A `jury.toml` naming two or more distinct vendors exits **3**
+unless at least that many actually contributed a review. That includes the case
+where a configured CLI is **not installed on this machine**: the shipped
+three-vendor `jury.toml` on a laptop with one CLI now fails, because a
+configuration promising three vendors and delivering one is exactly the collapse
+this guard exists to catch. A missing CLI is not an exemption.
+
+Only a config that never claimed cross-vendor consensus is left alone — Option A
+above, or any config with fewer distinct vendors enabled than the threshold.
+
+Two escapes, and they answer different questions:
+
+```bash
+jury --pr 123 --no-min-vendors        # accept a collapsed panel (or [jury.ci] min_vendors = 0)
+jury --pr 123 --strict                # fail at STARTUP on a missing CLI, before spending anything
+```
+
+`--no-min-vendors` (equivalently `min_vendors = 0` under `[jury.ci]`) says "one
+vendor is fine here". `--strict` does not lower the bar — it moves the failure
+earlier, so a missing CLI is reported before the run instead of as a collapsed
+panel after it. Exit 3 is distinct from the `--ci` findings failure (exit 1), so
+a caller can tell "the reviewers disagreed with you" from "the reviewers never
+ran", and the failure message names the opt-out:
+
+```console
+panel collapsed: 1 vendor(s) contributed a review, 2 required. An abstention is
+not an approval; cross-vendor consensus was not formed. To accept a collapsed
+panel, pass --no-min-vendors (or set [jury.ci] min_vendors = 0); to catch a
+missing CLI at startup instead, run with --strict.
+```
+
+The run's own count is in `--metadata-json` under `panel.vendors`:
+
+```bash
+jury --pr 123 --metadata-json run.json && jq '.panel' run.json
+# { "configured": 3, "effective": 1, "vendors": 1, "abstained": 0, "failed": 2, "short": true }
+```
 
 ---
 
@@ -544,7 +632,7 @@ Add `ai-jury` to your repository's `.pre-commit-config.yaml` to catch security i
 ```yaml
 repos:
   - repo: https://github.com/berkayturanci/ai-jury
-    rev: v1.15.1
+    rev: v1.18.1
     hooks:
       - id: ai-jury
         # Optional args: e.g. single round or fast preset
@@ -577,23 +665,150 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           args: "--auto --post --ci"
+          # min-vendors: "2"   # the default; see below
 ```
+
+**The Action refuses a collapsed panel by default.** `min-vendors` defaults to
+`2`, so a workflow that says nothing still gets the cross-vendor guard — before
+this, an Action consumer inherited a fail-soft run that exited 0 on a panel that
+had quietly become single-vendor. The input is appended as `--min-vendors N`
+unless `args` already names `--min-vendors` or `--no-min-vendors`, so an explicit
+choice in `args` always wins.
+
+| Value | Effect |
+| --- | --- |
+| `"2"` (default) | Fail the step (exit 3) when fewer than 2 distinct vendors contributed a review. |
+| `"3"` | Require all three of a three-vendor panel. |
+| `"0"` | Opt out — accept a single-vendor run, the pre-#682 behaviour. |
+| `""` (empty) | Same as the default. An unset repository or organization variable arrives as the empty string, so `min-vendors: ${{ vars.MIN_VENDORS }}` is a valid way to leave the guard alone. |
+
+The guard is inert for a single-vendor *configuration*, so a workflow running one
+reviewer does not need `min-vendors: "0"`. It is **not** inert for a runner that
+is missing one of several configured CLIs — that is a collapsed panel, and it
+fails: install the CLI, drop the agent from the config, or opt out explicitly. A
+non-integer value fails the step with a clear message rather than being spliced
+into the command line.
 
 ---
 
 ## 16. Full delivery governance with Keel + AI Jury
 
-For teams using [Keel](https://github.com/berkayturanci/keel) to automate software delivery from issue intake to verified merge, `ai-jury` serves as the multi-agent review gate in Keel's review phase:
+**Prerequisites:** [Keel](https://github.com/berkayturanci/keel) driving the
+repository (`.keel/project.yaml`), `jury` on `PATH` wherever `keel ship` runs. Keel
+does not depend on `ai-jury` — if the `jury` CLI is absent, the built-in `jury` gate
+is a fail-soft no-op.
+
+There is no `review:` key in Keel's project schema — `keel validate` rejects
+`review: {…}` with `unknown property 'review'`. The real integration is a built-in
+gate named `jury`, declared like `build` and `lint`:
 
 ```yaml
 # .keel/project.yaml
-review:
-  engine: ai-jury
-  preset: balanced
-  gating: true
+extends: keel
+core_version: "^1.0"
+base_branch: main
+gates: [build, lint, jury]
+knobs:
+  build_gate_cmd: "make test"
+  jury_timeout_s: 600
+  evidence_require_distinct_vendors: true
 ```
 
-When Keel executes `keel ship`, it convenes `ai-jury` cross-examination across your configured models to guarantee consensus before unlocking the merge window.
+`knobs.jury_timeout_s` bounds the wall-clock seconds the `jury` gate may run
+before it is killed (default `600`); a run that is killed, or that produces no
+parseable report, is recorded as a blocking `major` finding in gating mode rather
+than silently passing. See Keel's
+[`gates` and `knobs` reference](https://github.com/berkayturanci/keel/blob/main/docs/keel/configuration.md)
+for the full field list.
+
+### Turning the jury on
+
+`keel ship` decides per run whether the jury participates, with flags on the
+`ship` command itself:
+
+```bash
+keel ship --jury            # force the jury on, gating mode
+keel ship --jury-advisory   # force the jury on, report-only (never blocks)
+keel ship --no-jury         # force the jury off for this run
+```
+
+Precedence is `--no-jury` > `--jury` > tier-3 auto-on > off — a change that
+touches a `tier3_globs` path turns the jury on automatically (gating, unless
+`--jury-advisory` is also passed), and `--no-jury` always wins over that.
+
+### What keel does with the report
+
+At the `s8 test` step, a `keel ship` run invokes `jury --format json
+--diff-file <tmp>` read-only against the PR diff (never `--strict`) and maps each
+finding's `ai-jury` severity onto a Keel severity:
+
+| `ai-jury` severity | Keel severity | Effect in gating mode |
+|---|---|---|
+| `critical`, `blocker` | `critical` | blocks the merge |
+| `major` | `major` | blocks the merge |
+| `minor` | `minor` | gated suggestion (fix before merge, or explicitly defer) |
+| `nit`, `info`, `note` | `nit` | advisory only |
+| anything else / unrecognized | `minor` | gated suggestion |
+
+What runs this step is Keel's **ship adapter** — the `ship` command/skill
+generated from `src/keel/adapters/commands/ship.md` in the keel repository, not
+any code path in `src/keel/*.py`. (Anchors below are keel `main` as of
+2026-09-04.) The adapter:
+
+- Posts a single verdict comment to the PR via `keel post-comment --artifact
+  jury-verdict`, tagged with the `keel.jury-verdict.v1` marker and `head: <sha>`
+  so re-runs on the same commit stay idempotent instead of piling up comments.
+- Saves the raw JSON report to `.keel/state/jury/<run-id>.json` by adding
+  `--format json -o .keel/state/jury/$RUN_ID.json` to that same jury invocation
+  (`commands/ship.md:711`, s8, "Save the jury artifact for visualizers"). It is
+  untracked state, never committed, and the write is fail-soft — display-only,
+  it never gates. `keel-visual` only *reads* the file, to show the jury verdict
+  alongside the run on the activity board.
+- Passes the count of **distinct participating vendors** (the ones that
+  actually returned output, not just the ones configured) to `keel
+  evidence-verify --jury-vendors <N>` at merge time. A panel with fewer than 2
+  distinct vendors is downgraded from gating to advisory before that evidence
+  check runs, even if the earlier `s8` gate treated the run as gating. Setting
+  `knobs.evidence_require_distinct_vendors: true` (shown above) additionally
+  requires every *required reviewer* verdict to carry vendor provenance, with
+  no two sharing a vendor; the jury verdict is a separate artifact and is
+  checked on its own through that participating-vendor count, not this knob.
+  See Keel's
+  [evidence guide](https://github.com/berkayturanci/keel/blob/main/docs/keel/evidence.md)
+  for how the pre-merge evidence gate reads these signals.
+
+### Not yet available
+
+Two `ai-jury` capabilities mentioned elsewhere in this cookbook are not wired
+into Keel yet: per-panelist ballots (`--format keel-reviews`) are tracked in
+[ai-jury#663](https://github.com/berkayturanci/ai-jury/issues/663), and a
+`jury run-agent` recipe for Keel's implementer/reviewer roles is tracked in
+[ai-jury#661](https://github.com/berkayturanci/ai-jury/issues/661). Until
+those land, the `jury` gate above is the full extent of the Keel integration.
+
+### Use the panel as Keel's reviewers
+
+The gate above consumes the panel's *consolidated* findings. To have each
+panelist appear as its own reviewer instead — one head-pinned verdict per agent,
+carrying the vendor and model that produced it — render the run with
+`--format keel-reviews` and hand the file to `keel review`:
+
+```bash
+jury --pr 123 --format keel-reviews -o reviews.json
+keel review --reviews reviews.json --dry-run
+```
+
+The file is a JSON array of `{reviewer, verdict, scope, findings, testing,
+vendor, model, model_source, counts_as_review}` records, one per seat that ran
+plus the chair as `reviewer: "chair"` — see
+[report-format.md](report-format.md#the-keel-reviews-bundle). A seat that
+returned nothing, or answered without naming a file, line or symbol, is recorded
+as an abstention and carries `counts_as_review: false`; that is the flag to count
+on, because keel refuses such a verdict itself.
+Because every record carries its own `vendor`, a three-seat panel spread over
+three vendors satisfies Keel's distinct-vendor evidence requirement on its own.
+Producing the bundle is an `ai-jury` concern only; the Keel-side consumption of
+it is tracked in [keel#1015](https://github.com/berkayturanci/keel/issues/1015).
 
 ---
 
@@ -639,7 +854,30 @@ jury apply --report report.md 1
 
 ## 19. Fast, frugal reviews with `--tiered` routing and `--hints`
 
-For cost optimization and noise reduction on large repositories:
+For cost optimization and noise reduction on large repositories, label the
+cheap seats and let the diff's risk decide who reviews:
+
+```toml
+# jury.toml
+[jury]
+chair = "claude"
+
+[[agent]]
+name = "claude"
+vendor = "anthropic"
+command = "claude"          # frontier (default): anchors routed panels, chairs
+
+[[agent]]
+name = "gpt"
+vendor = "openai"
+command = "codex"           # frontier: benched on routine diffs, back on escalation
+
+[[agent]]
+name = "flash"
+vendor = "google"
+command = "agy"
+tier = "economical"         # the seat routine diffs are reviewed by
+```
 
 ```bash
 # Combine fast linter pre-pass and tiered model routing with frontier protection
@@ -647,7 +885,7 @@ jury --pr 123 --hints --tiered
 ```
 
 - `--hints` runs fast local linters (Ruff, ESLint) and informs LLMs so they skip trivial formatting and focus on deep bugs.
-- `--tiered` routes routine code to economical models while keeping frontier models as anchors for complex or security-sensitive changes.
+- `--tiered` seats `flash` + `claude` on a routine diff and benches `gpt`; a security-sensitive or large diff seats all three; a `critical`/`major` finding after round 1 brings `gpt` into the debate. The decision is in `metadata.routing` of the JSON report and on the `routing:` line of the Markdown report.
 
 ---
 
@@ -684,6 +922,151 @@ export GROQ_API_KEY="gsk-..."
 export JURY_ALLOW_REMOTE_ENDPOINT=1
 
 jury --pr 123 --ci
+```
+
+---
+
+## 21. Run one agent for an orchestrator (keel)
+
+The panel is the point of ai-jury, but an orchestrator sometimes needs *one*
+agent: dispatch an implementer, ask a single gate reviewer, get a chair's call.
+`jury run-agent` is that entry point — the same adapters, the same read-only
+flags, the same timeouts and the same typed error codes a panel run uses, for
+one agent, with a JSON result on stdout.
+
+```bash
+# One reviewer, read-only, JSON on stdout
+jury run-agent --agent claude --role review --prompt-file gate.md
+
+# A specific model, with a deliberate wall-clock bound
+jury run-agent --agent codex:gpt-5.2 --role gate --prompt-file gate.md --timeout 900
+
+# An implementer that may edit the tree — write access is explicit, never implied
+jury run-agent --agent agy --role implement --allow-write --cwd ../worktree \
+  --prompt-file task.md
+
+# Just the text, for a shell pipeline
+jury run-agent --agent claude --role chair --prompt-file decide.md --format text
+```
+
+The result document (`schema_version: "ai-jury.run-agent.v1"`):
+
+```json
+{
+  "schema_version": "ai-jury.run-agent.v1",
+  "ok": true,
+  "agent": "codex",
+  "vendor": "openai",
+  "model": "gpt-5.2",
+  "role": "gate",
+  "transport": "cli",
+  "text": "...the agent's answer...",
+  "exit_code": 0,
+  "duration_s": 41.2,
+  "timed_out": false,
+  "error_code": null,
+  "error": null,
+  "attribution": { "vendor": "openai", "model": "gpt-5.2", "label": "agent:openai model:gpt-5" }
+}
+```
+
+`attribution.label` is the pair an orchestrator applies verbatim: `agent:<vendor>`
+plus a coarse `model:<base>`, so a point-release bump does not fork the
+attribution history of otherwise-identical work. Split it on whitespace.
+
+The base is **family + major**, and the grouping is deliberately uneven: it is
+byte-for-byte keel's `agents.model_base`, because both projects label the same
+issues and a divergent rule would split one project's history. A tier or effort
+suffix collapses (`gemini-3.8-flash`, `gemini-3.8-flash-high` and
+`gemini-3.8-pro` are all `model:gemini-3`); a hyphen-spelled version does not
+(`claude-opus-4-5` and `claude-opus-4-6` stay distinct). Read the `model` field
+when you need the exact id.
+
+**Roles decide privilege, and the flag cannot override that.** `review`, `gate`
+and `chair` always run under the vendor's read-only invocation — the exact one a
+panel review uses (`claude --disallowed-tools …`, `codex -s read-only`, `agy
+--sandbox`). Passing `--allow-write` to them warns and is ignored: those roles
+read attacker-controlled content, and a flag must not be able to make a reviewer
+write-capable. `implement` and `fix` are the only write-capable roles, and only
+with `--allow-write`; without it the command exits 2 rather than quietly running
+a read-only agent and reporting work that never happened.
+
+**Exit codes:** `0` the agent ran and produced output, `1` it ran and failed
+(read `error_code` — the same fail-soft vocabulary as a panel run), `2` the
+request itself was refused.
+
+### Long runs: dispatch now, collect later
+
+```bash
+# Start it in the background; prints the run id immediately
+jury run-agent --agent agy --role implement --allow-write \
+  --prompt-file task.md --detach --run-id issue-661
+
+# ... do other work ...
+
+jury run-agent --status                 # list every recorded run
+jury run-agent --wait issue-661         # block, then print the result document
+jury run-agent --wait issue-661 --wait-timeout 1800   # ...with your own deadline
+```
+
+`--timeout` bounds the **agent**; `--wait-timeout` bounds the **wait**. A bare
+`--wait` is not unbounded: it defaults to the run's own timeout plus a minute of
+head-room to write its state file, so a script cannot hang on a run that died.
+A run that was never started is reported immediately rather than waited on, and
+both `--status` and `--wait` report a run whose process is gone as `lost`
+rather than leaving it `running` forever — `--wait` returns as soon as it sees
+that, instead of blocking for a result that is not coming.
+
+**`running` is a claim, not a guarantee.** The status means "a process with
+this pid existed and we have not seen it exit". Pids are recycled, so a state
+file that outlives its process — across a reboot, or in a `--cache-dir` shared
+between machines or containers — can name a pid that some unrelated process now
+holds, and the run keeps reporting `running`. The failure is deliberately
+one-directional: a stale pid leaves a finished-looking run marked `running`
+(and its `started_at` shows how old the claim is), never the reverse, so a live
+run is never declared dead. Liveness is probed on POSIX only; on Windows a pid
+cannot be probed without terminating it, so every unfinished run there reads as
+`running` and `--wait` says so once on stderr before falling back to its
+deadline — the wait is still bounded, it just cannot end early. If you share a cache directory, treat `running` from another host as
+unknown and read the state file's `started_at` yourself.
+
+State lives in `<cache-dir>/run-agent/<run-id>.json` (0600, in a 0700 directory)
+with the child's console log beside it as `<run-id>.out`. `--cache-dir` and
+`$JURY_CACHE_DIR` move both. A run id becomes a filename, so it is restricted to
+letters, digits, `.`, `_` and `-`; anything that could point outside the runs
+directory is refused.
+
+### From keel, and what keel actually does
+
+`jury run-agent` is the entry point for *any* orchestrator that wants one agent,
+one role and one JSON result: the caller picks the agent and the role, ai-jury
+owns the argv, the sandbox and the error taxonomy, and the result carries the
+attribution the caller can write onto an issue.
+
+**Keel is not that caller today.** Keel's `keel delegate run`
+(`src/keel/delegate.py` and `src/keel/delegaterun.py`, keel `main` as of
+2026-09-04) is an
+independent port of the same contract, not a client of this command: its module
+docstring names ai-jury's `src/ai_jury/adapters.py` as a *read-only reference*
+for the vendor invocations, and it re-derives the argv shapes, the
+role-to-privilege policy and the `agent:<vendor>` / `model:<base>` attribution
+label on its own. The string `jury run-agent` does not appear anywhere in keel's
+tree — `git grep 'jury run-agent'` there returns nothing. Two implementations
+of one contract, agreeing by construction and by review, neither running the
+other.
+
+The change that will make keel call the jury is
+[keel#1015](https://github.com/berkayturanci/keel/issues/1015), which makes the
+panel keel's tier-3 review panel, invoked from `s7`. Update this section again
+when that merges.
+
+So the invocation below is the shape a caller uses — written with keel's
+environment variable names, since a host agent driving a keel worktree is the
+obvious first one:
+
+```bash
+jury run-agent --agent "$KEEL_DELEGATE" --role implement --allow-write \
+  --cwd "$KEEL_WORKTREE" --prompt-file "$KEEL_PROMPT" --timeout 3600 --detach
 ```
 
 ---

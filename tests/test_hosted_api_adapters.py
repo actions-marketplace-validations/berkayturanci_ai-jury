@@ -644,9 +644,9 @@ class PrivilegeAuditTest(unittest.TestCase):
         self.assertEqual(audit_agent(spec3), [])
 
     def test_enforce_read_only_is_a_no_op_for_hosted_api(self):
-        self.assertEqual(enforce_read_only("anthropic-api", "claude-api", []), [])
-        self.assertEqual(enforce_read_only("openai-api", "codex-api", ["whatever"]), ["whatever"])
-        self.assertEqual(enforce_read_only("google-api", "gemini-api", []), [])
+        self.assertEqual(enforce_read_only("anthropic-api", []), [])
+        self.assertEqual(enforce_read_only("openai-api", ["whatever"]), ["whatever"])
+        self.assertEqual(enforce_read_only("google-api", []), [])
 
 
 class ScaffoldTemplateTest(unittest.TestCase):
@@ -675,6 +675,67 @@ class ScaffoldTemplateTest(unittest.TestCase):
             build_config(["invalid_agent_xyz"])
         self.assertIn("openrouter", str(ctx.exception))
         self.assertIn("deepseek", str(ctx.exception))
+
+
+class EnvVarNameIsANameNotACredentialTest(unittest.TestCase):
+    """`_env_var_name()` resolves and bounds the DISPLAYED name (#669 / CodeQL).
+
+    The renamed accessor (was `_api_key_env`) is what a `--doctor` report and its
+    JSON export echo. `_api_key()` keeps its sensitive name because it really
+    does hold the credential — and nothing renders it.
+    """
+
+    def test_vendor_default_is_used_when_nothing_is_configured(self):
+        self.assertEqual(
+            AnthropicApiAdapter(_anthropic_spec())._env_var_name(), "ANTHROPIC_API_KEY"
+        )
+        self.assertEqual(OpenAiApiAdapter(_openai_spec())._env_var_name(), "OPENAI_API_KEY")
+        self.assertEqual(GoogleApiAdapter(_google_spec())._env_var_name(), "GEMINI_API_KEY")
+
+    def test_a_configured_name_overrides_the_vendor_default(self):
+        spec = AgentSpec(
+            name="r",
+            vendor="openai-compatible",
+            model="m",
+            endpoint="http://localhost:9/v1",
+            api_key_env="MY_TOKEN_VAR",
+        )
+        adapter = make_adapter(spec)
+        self.assertEqual(adapter._env_var_name(), "MY_TOKEN_VAR")
+        with mock.patch.dict("os.environ", {"MY_TOKEN_VAR": "s3cret"}, clear=True):
+            self.assertEqual(adapter._api_key(), "s3cret")
+
+    def test_a_malformed_name_falls_back_to_the_vendor_default(self):
+        spec = AgentSpec(
+            name="r",
+            vendor="openai-compatible",
+            model="m",
+            endpoint="http://localhost:9/v1",
+            api_key_env='EVIL", "injected": "yes',
+        )
+        self.assertEqual(make_adapter(spec)._env_var_name(), "OPENAI_API_KEY")
+
+    def test_capability_warnings_name_the_variable_and_never_its_value(self):
+        secret = "sk-ADAPTERWARN0123456789abcdefSECRET"
+        spec = AgentSpec(name="a", vendor="anthropic-api", model="m")
+        with mock.patch.dict("os.environ", {}, clear=True):
+            unset = AnthropicApiAdapter(spec).detect_capabilities()
+        self.assertIn("ANTHROPIC_API_KEY", " ".join(unset["warnings"]))
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": secret}, clear=True):
+            configured = AnthropicApiAdapter(spec).detect_capabilities()
+        self.assertNotIn(secret, repr(configured))
+
+    def test_an_unusable_key_is_reported_without_quoting_it(self):
+        # A trailing newline trips the header guard; the message must name the
+        # variable, not echo the value that cannot be scrubbed back out.
+        secret = "sk-CONTROLCHAR0123456789abcdef\n"
+        spec = AgentSpec(name="a", vendor="anthropic-api", model="m")
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": secret}, clear=True):
+            caps = AnthropicApiAdapter(spec).detect_capabilities()
+            result = AnthropicApiAdapter(spec).run("prompt")
+        self.assertIn("ANTHROPIC_API_KEY", " ".join(caps["warnings"]))
+        self.assertNotIn(secret.strip(), repr(caps))
+        self.assertNotIn(secret.strip(), result.error or "")
 
 
 if __name__ == "__main__":

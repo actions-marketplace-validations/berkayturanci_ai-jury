@@ -9,7 +9,7 @@ from ai_jury.config import (
     _from_dict,
 )
 from ai_jury.orchestrator import run_jury
-from ai_jury.redaction import redact, redact_url_userinfo
+from ai_jury.redaction import redact, redact_url_userinfo, safe_env_var_name
 
 
 class RedactionTests(unittest.TestCase):
@@ -177,9 +177,25 @@ class RedactionTests(unittest.TestCase):
         #
         # `process_time` is this process's CPU time, so load elsewhere on the
         # machine cannot inflate it, and `min` over repeats is the standard
-        # estimator for a timed body — noise only ever adds. Measured here:
-        # linear 1.7-2.2x per doubling (identical under `coverage`), the `*`
-        # mutation 3.9x. The 3.0 threshold sits between with room either way.
+        # estimator for a timed body — noise only ever adds.
+        #
+        # The step is 4x, not 2x, and that is the whole of #761. Measured here
+        # at the calibrated 6 000 chars, eight trials in each condition: the
+        # shipped regex topped out at 4.60x — untraced, under `coverage`
+        # (both terms are in `re`, so tracing does not dilute the ratio the way
+        # it does the sibling in `tests/test_injection.py`), and with every
+        # core saturated — clustering at ~4.1x, and reading *low* only when a
+        # noisy base inflated the denominator. Mutating both `{0,40}` runs to
+        # `*` reads 16.6-18.5x at 1 500 and 3 000 chars — measured below the
+        # calibrated size because that mutation costs 4.2 s at 12 000, and
+        # stable across both — and fails this test at 15.75x when run through
+        # it. So 8.0 sits ~1.7x above the worst linear reading and ~2x below
+        # the cheapest quadratic one.
+        #
+        # The 2x step it replaces left ~1.15x: linear is ~2 there against a 3.0
+        # threshold, and a loaded machine reached 2.53x, which is the flake
+        # #761 was filed for. The separation is what buys the stability, not a
+        # bigger tolerance — 8.0 still catches the mutation by better than 2x.
         import time as _t
 
         def cpu_min(size: int, repeats: int) -> float:
@@ -217,10 +233,17 @@ class RedactionTests(unittest.TestCase):
         # floor fails at 1.7x with CI's exact message, and divides by a
         # zero-quantised base at 0.5x. This floor passes across 0.5x-3.0x.
         #
-        # Ten ticks of headroom bounds the base error at 10% and the ratio's at
-        # ~15%, so linear reads at most ~2.3x and quadratic at least ~3.4x. The
+        # Ten ticks of headroom bounds the base error at 10%, and the 4x
+        # measurement carries a quarter of that, so the ratio's error is ~15%
+        # at worst: linear reads at most ~4.6x and quadratic at least ~14x. The
         # input grows until it gets there, which also means a faster machine
         # raises the size instead of going flaky.
+        #
+        # A 4x step costs 4x the top measurement, so the calibrated size is
+        # worth watching. It stays at the initial 6 000 here — 24 000 chars at
+        # the top, ~0.2 s of CPU for the whole test and ~1 s of wall on a busy
+        # machine. A machine fast enough to be bumped a rung pays little more:
+        # the size it is raised to is bought with the speed that raised it.
         floor = max(10 * clock_step(), 0.005)
         size = 6_000
         for _ in range(5):
@@ -234,14 +257,14 @@ class RedactionTests(unittest.TestCase):
             self.skipTest(f"cannot time redact above the clock step at {size} chars")
 
         base = cpu_min(size, repeats=3)
-        doubled = cpu_min(size * 2, repeats=3)
-        ratio = doubled / base
+        quadrupled = cpu_min(size * 4, repeats=3)
+        ratio = quadrupled / base
         self.assertLess(
             ratio,
-            3.0,
-            f"doubling the input multiplied the scan by {ratio:.2f}x "
-            f"({base:.4f}s -> {doubled:.4f}s at {size} chars); linear is ~2x "
-            "and quadratic ~4x, so the bounded identifier runs in "
+            8.0,
+            f"quadrupling the input multiplied the scan by {ratio:.2f}x "
+            f"({base:.4f}s -> {quadrupled:.4f}s at {size} chars); linear is ~4x "
+            "and quadratic ~16x, so the bounded identifier runs in "
             "`secret_assignment` have probably become unbounded",
         )
 
@@ -431,6 +454,58 @@ class ContextSelectionTests(unittest.TestCase):
         )
         self.assertFalse(outcome.redact_secrets)
         self.assertEqual(outcome.redaction_count, 0)
+
+
+class SafeEnvVarNameTests(unittest.TestCase):
+    """`api_key_env` is displayed, so it is rebuilt rather than passed through."""
+
+    FALLBACK = "OPENAI_API_KEY"
+
+    def _safe(self, raw):
+        return safe_env_var_name(raw, self.FALLBACK)
+
+    def test_a_valid_name_survives_unchanged(self):
+        for name in ("OPENAI_API_KEY", "_private", "A1", "a_b_9", "_"):
+            self.assertEqual(self._safe(name), name)
+
+    def test_result_is_rebuilt_not_the_input_object(self):
+        # The point of the function: the returned characters come from a module
+        # constant, so nothing derived from the config field survives into it.
+        # A separately-constructed equal string proves the identity is not reused.
+        raw = "".join(["OPEN", "AI_API_KEY"])
+        result = self._safe(raw)
+        self.assertEqual(result, raw)
+        self.assertIsNot(result, raw)
+
+    def test_structural_injection_is_refused(self):
+        # A name spliced into a JSON export or a terminal report must not be able
+        # to carry structure or control characters.
+        for hostile in (
+            'EVIL", "injected": "yes',
+            "LINE\nBREAK",
+            "TAB\tSEP",
+            "ansi\x1b[31m",
+            "quote'name",
+            "semi;colon",
+            "sp ace",
+            "uniçode",
+        ):
+            self.assertEqual(self._safe(hostile), self.FALLBACK, hostile)
+
+    def test_empty_and_non_string_fall_back(self):
+        for raw in ("", None, 7, [], {"a": 1}, True):
+            self.assertEqual(self._safe(raw), self.FALLBACK)
+
+    def test_leading_digit_is_not_a_valid_name(self):
+        self.assertEqual(self._safe("9LIVES"), self.FALLBACK)
+        self.assertEqual(self._safe("L9IVES"), "L9IVES")
+
+    def test_over_long_names_fall_back(self):
+        self.assertEqual(self._safe("A" * 128), "A" * 128)
+        self.assertEqual(self._safe("A" * 129), self.FALLBACK)
+
+    def test_fallback_is_returned_verbatim(self):
+        self.assertEqual(safe_env_var_name("no good!", "GEMINI_API_KEY"), "GEMINI_API_KEY")
 
 
 if __name__ == "__main__":

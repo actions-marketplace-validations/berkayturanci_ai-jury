@@ -18,10 +18,10 @@ runs across platforms (and the support status of each), see the
 
 ## Skill directory layout
 
-The skill is a self-contained directory under [`skill/`](../skill):
+The skill is a self-contained directory under [`skills/`](../skills):
 
 ```text
-skill/
+skills/
 └── ai-jury/
     └── SKILL.md      # YAML front matter (name, description) + instructions
 ```
@@ -34,8 +34,13 @@ skill composes with an existing review workflow.
 
 Nothing else is required for the skill to work — it carries no code of its own; it drives
 the `jury` CLI. The repository's [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json)
-points its `skills` field at this same `skill/` directory, so the plugin install path and
+points its `skills` field at this same `skills/` directory, so the plugin install path and
 the manual copy path serve the identical artifact (no duplication).
+
+The directory is at the repository root and named `skills/` for a second reason:
+Antigravity discovers plugin components **only** by root-directory convention and reads no
+path from the manifest, so a differently-named directory imports as nothing at all —
+silently, with the install still reporting success (#775).
 
 ## Install into a skill folder
 
@@ -44,12 +49,16 @@ command. Two install routes exist; pick by host.
 
 ### Claude Code (plugin — recommended)
 
-This repo doubles as a single-plugin marketplace. Install the bundled skill as a plugin:
+This repo doubles as a single-plugin marketplace, and in a session the short form
+is `/plugin marketplace add berkayturanci/ai-jury` then
+`/plugin install ai-jury@ai-jury`.
 
-```text
-/plugin marketplace add berkayturanci/ai-jury
-/plugin install ai-jury@ai-jury
-```
+**The CLI commands, and the update path, are in [install.md](install.md#claude-code)**
+— along with the same for Codex, Antigravity and Cursor. They are deliberately not
+repeated here: `plugin install` is a no-op on an installed plugin, so an
+install-only recipe leaves a reader on a version they cannot move off, and a second
+copy of the recipes is how this page came to describe one agent while the matrix
+described four.
 
 The manifests that make this work are in [`.claude-plugin/`](../.claude-plugin/)
 (`marketplace.json` + `plugin.json`); they are documented in the
@@ -60,17 +69,20 @@ The manifests that make this work are in [`.claude-plugin/`](../.claude-plugin/)
 Copy the directory into the host project's skill folder:
 
 ```bash
-cp -R skill/ai-jury <your-project>/.claude/skills/ai-jury
+cp -R skills/ai-jury <your-project>/.claude/skills/ai-jury
 ```
 
 ### Codex / other Claude-compatible skill folders
 
-Codex does not yet expose a stable plugin manifest equivalent. Until it does, install the
-skill the same way — copy `skill/ai-jury/` into the host's skill directory — or
-reference the `jury` command from an `AGENTS.md`. The
-[Codex template in the platform matrix](platforms.md#codex-cli-template--manual) shows the
-minimal `AGENTS.md` snippet; the underlying capability (running `jury`) is identical
-across hosts, only the packaging differs.
+Codex has a plugin marketplace, and `.codex-plugin/plugin.json` is this repository's
+manifest for it: `codex plugin marketplace add` then `codex plugin add ai-jury@ai-jury`,
+with the update path in [install.md](install.md#codex). That is the route to prefer.
+
+The copy-the-folder route below still works on any Claude-compatible skill directory, and
+so does referencing the `jury` command from an `AGENTS.md` — see the
+[snippet in the platform matrix](platforms.md#codex-cli). Neither needs a plugin at all,
+which is what makes them useful in a container or a CI job. The underlying capability
+(running `jury`) is identical across hosts; only the packaging differs.
 
 ## Required external tools
 

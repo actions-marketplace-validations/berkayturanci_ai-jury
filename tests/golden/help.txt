@@ -7,9 +7,11 @@ usage: jury [-h] [--pr PR] [--issue ISSUE] [--repo REPO]
             [--total-timeout TOTAL_TIMEOUT] [--phase-timeout PHASE_TIMEOUT]
             [--retries RETRIES] [--max-diff-bytes MAX_DIFF_BYTES] [--chunk]
             [--no-chunk] [--exclude GLOB] [--include GLOB] [--seed SEED]
-            [--chair CHAIR] [--mock] [--strict] [--min-vendors N] [--verify]
-            [--no-verify] [--doctor] [--write WRITE] [-o OUTPUT]
-            [--metadata-json PATH] [--format {markdown,json,sarif}]
+            [--chair CHAIR] [--mock] [--strict] [--min-vendors N]
+            [--no-min-vendors] [--min-reviews N] [--verify] [--no-verify]
+            [--doctor] [--json] [--write WRITE] [--effort {low,medium,high}]
+            [-o OUTPUT] [--metadata-json PATH]
+            [--format {markdown,json,sarif,keel-reviews}]
             [--decision {chair,vote}] [--transcript] [--no-transcript]
             [--verbose] [--live] [--theater] [--no-theater]
             [--theater-style {flat,pixel}] [--post-summary] [--post-inline]
@@ -17,7 +19,7 @@ usage: jury [-h] [--pr PR] [--issue ISSUE] [--repo REPO]
             [--label] [--ci] [--fail-on FAIL_ON] [--cache] [--clear-cache]
             [--cache-dir CACHE_DIR] [--suggest-patches] [--patches-out PATH]
             [--incremental] [-q] [--config-validate] [--strict-config]
-            [--tiered] [--hints] [--version]
+            [--tiered] [--hints] [--no-hints] [--version]
 
 Cross-vendor multi-agent PR review jury.
 
@@ -64,20 +66,39 @@ options:
   --mock                offline demo: use deterministic mock agents
   --strict              fail if any configured agent CLI is missing
   --min-vendors N       fail (exit 3) unless at least N distinct vendors
-                        contributed a review; 0 disables. --strict checks
+                        contributed a review; 0 disables. Default from config
+                        ([jury.ci] min_vendors, shipped as 2). --strict checks
                         availability at startup, this checks participation at
                         the end
+  --no-min-vendors      opt out of the cross-vendor guard: accept a run whose
+                        panel collapsed to a single vendor (same as --min-
+                        vendors 0)
+  --min-reviews N       require at least N reviews for a downstream consumer
+                        (a panel ballot that names what it read and votes;
+                        neither the chair's synthesis record nor an abstaining
+                        ballot is one); 0 disables. Checked before the panel
+                        runs and again on the result (exit 3). Default from
+                        config ([jury.ci] min_reviews, shipped as 0)
   --verify              run the verification round (default: from config)
   --no-verify           skip the verification round
   --doctor              print a local readiness diagnostics report and exit
                         (no telemetry is collected or sent)
+  --json                with --doctor, print the machine-readable provider
+                        export (schema ai-jury.doctor.v1) as the only thing on
+                        stdout
   --write WRITE         with --doctor, also write the diagnostics as JSON to
                         this path (secrets redacted)
+  --effort {low,medium,high}
+                        reasoning effort for every agent this run (overrides
+                        [[agent]] effort); ignored with a warning for agents
+                        whose vendor has no effort control
   -o, --output OUTPUT   write the report to a file instead of stdout
   --metadata-json PATH  write machine-readable run metadata (durations,
                         status, rounds) as JSON
-  --format {markdown,json,sarif}
-                        output format for stdout/--output (default: markdown)
+  --format {markdown,json,sarif,keel-reviews}
+                        output format for stdout/--output (default: markdown);
+                        'keel-reviews' emits one review record per panelist
+                        plus the chair
   --decision {chair,vote}
                         final verdict: 'chair' synthesis (default) or panel
                         'vote' (tally the reviewers); overrides [jury]
@@ -145,6 +166,8 @@ options:
                         anchor (issue #524)
   --hints               run local static analysis pre-pass (Ruff/ESLint) to
                         inject hints (issue #523)
+  --no-hints            skip the static analysis pre-pass even if jury.toml
+                        enables it
   --version             show program's version number and exit
 
 input:
@@ -159,3 +182,6 @@ input:
                         repo)
   --commits COMMITS     review a commit range, e.g. origin/main..HEAD or
                         HEAD~5..HEAD (needs a git repo)
+
+Subcommands (each takes its own --help): init, config, comment, apply, replay,
+run-agent, cache clear, examples, guide.

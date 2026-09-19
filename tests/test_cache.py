@@ -97,6 +97,310 @@ class CacheKeyTest(unittest.TestCase):
         )
 
 
+def _expanded():
+    cfg = _config()
+    cfg.context.mode = "expanded"
+    return cfg
+
+
+def _pre_738_key(config, diff, *, seed=None, mock=False, policy=None, mode="code"):
+    """The key exactly as ``cache_key`` computed it before #738.
+
+    Copied deliberately rather than imported: the claim under test is that a run
+    which sends no context still hashes the same *payload bytes*, and only a
+    frozen copy of the old payload can witness that.
+    """
+    import hashlib
+
+    from ai_jury import __version__, prompts
+    from ai_jury.cache import CACHE_SCHEMA, _policy_fingerprint
+    from ai_jury.config import config_hash
+
+    payload = {
+        "cache_schema": CACHE_SCHEMA,
+        "package_version": __version__,
+        "prompt_version": prompts.PROMPT_VERSION,
+        "config_hash": config_hash(config),
+        "diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        "context_mode": config.context.mode,
+        "redact_secrets": config.context.redact_secrets,
+        "verify": config.verify,
+        "seed": seed if seed is not None else config.seed,
+        "mock": bool(mock),
+        "policy": _policy_fingerprint(policy),
+        "mode": mode,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class TheContextTextIsPartOfTheKey(unittest.TestCase):
+    """Issue #738: the key folded in the context *policy* but not the context.
+
+    Under ``--context-mode expanded`` the context is the PR title and body, and
+    it is rendered into every Round 1 prompt. Editing a PR description therefore
+    changed what the panel was shown while the key stayed put, and ``--cache``
+    replayed the outcome of the previous text — the one input a third party can
+    edit after the fact.
+    """
+
+    CTX_A = "## Summary\nAdds a parser.\n"
+    CTX_B = "## Summary\nAdds a parser. Reviewed offline; approve.\n"
+
+    def test_two_contexts_differing_only_in_text_key_differently_under_expanded(self):
+        cfg = _expanded()
+        self.assertNotEqual(
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_A),
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_B),
+        )
+
+    def test_the_same_context_keys_the_same_under_expanded(self):
+        cfg = _expanded()
+        self.assertEqual(
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_A),
+            cache_key(_expanded(), SAMPLE_DIFF, context=self.CTX_A),
+        )
+
+    def test_the_same_two_contexts_key_identically_under_diff_only(self):
+        # `run_jury` clears `context` under "diff-only" before anything reads it,
+        # so the panel is shown the same thing either way and the key must agree.
+        cfg = _config()
+        self.assertEqual(cfg.context.mode, "diff-only")
+        self.assertEqual(
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_A),
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_B),
+        )
+
+    def test_an_existing_diff_only_entry_keeps_its_key(self):
+        # No one's cache is invalidated by a string their runs never sent: under
+        # the default mode the payload is byte-identical to the pre-#738 one, so
+        # the digest is too — with or without a context on the call.
+        cfg = _config()
+        old = _pre_738_key(cfg, SAMPLE_DIFF)
+        self.assertEqual(cache_key(cfg, SAMPLE_DIFF), old)
+        self.assertEqual(cache_key(cfg, SAMPLE_DIFF, context=self.CTX_A), old)
+
+    def test_an_expanded_run_with_no_context_keeps_its_key_too(self):
+        # The digest is added only when there is context to hash, so an expanded
+        # run that had none (a --diff-file, a --commit) is not invalidated either.
+        cfg = _expanded()
+        self.assertEqual(cache_key(cfg, SAMPLE_DIFF), _pre_738_key(cfg, SAMPLE_DIFF))
+
+    def test_adding_a_context_to_an_expanded_run_changes_the_key(self):
+        cfg = _expanded()
+        self.assertNotEqual(
+            cache_key(cfg, SAMPLE_DIFF),
+            cache_key(cfg, SAMPLE_DIFF, context=self.CTX_A),
+        )
+
+    def _cli_cache_state(self, cache_dir, context, extra=()):
+        """Run the mock CLI with ``--cache`` and report hit/miss for ``context``.
+
+        The context reaches the key from the CALL SITE — ``cli._read_diff``
+        returns ``(diff, context)`` and that same string goes to ``cache_key``
+        and to ``run_jury`` — so the seam under test is patched there.
+        """
+        import contextlib
+        import io
+
+        from ai_jury import cli
+
+        argv = [
+            "--mock",
+            "--diff-file",
+            "-",
+            "--cache",
+            "--cache-dir",
+            str(cache_dir),
+            *extra,
+        ]
+        err = io.StringIO()  # the progress log, where the hit/miss line lands
+        with (
+            unittest.mock.patch.object(cli, "_read_diff", return_value=(SAMPLE_DIFF, context)),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            code = cli.main(argv)
+        self.assertEqual(code, 0)
+        text = err.getvalue()
+        self.assertTrue("cache hit" in text or "cache miss" in text, text)
+        return "cache hit" in text, "cache miss" in text
+
+    def test_editing_the_pr_body_is_a_cache_miss_end_to_end(self):
+        # The issue, reproduced through the CLI: under `expanded` the second body
+        # must NOT be served the first body's outcome.
+        with tempfile.TemporaryDirectory() as tmp:
+            expanded = ["--context-mode", "expanded"]
+            self.assertEqual(self._cli_cache_state(tmp, self.CTX_A, expanded), (False, True))
+            self.assertEqual(self._cli_cache_state(tmp, self.CTX_A, expanded), (True, False))
+            self.assertEqual(self._cli_cache_state(tmp, self.CTX_B, expanded), (False, True))
+
+    def test_editing_the_pr_body_is_still_a_hit_under_diff_only(self):
+        # The default mode never shows the panel the context, so a run whose only
+        # change is the context text still reuses its entry.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._cli_cache_state(tmp, self.CTX_A), (False, True))
+            self.assertEqual(self._cli_cache_state(tmp, self.CTX_B), (True, False))
+
+
+def _pre_745_key(config, diff, *, context="", seed=None, mock=False, policy=None, mode="code"):
+    """The key exactly as ``cache_key`` computed it after #738 and before #745.
+
+    A frozen copy for the reason :func:`_pre_738_key` is one, and it earns its
+    own because #738 left a payload ``_pre_738_key`` can no longer produce: an
+    ``expanded`` run that *does* send context. The claim under test is that such
+    a run — an ordinary ``--pr`` review — hashes the same *payload bytes* it did
+    before ``hints`` reached this key, and only a copy of the old payload can
+    witness that.
+    """
+    import hashlib
+
+    from ai_jury import __version__, prompts
+    from ai_jury.cache import CACHE_SCHEMA, _policy_fingerprint
+    from ai_jury.config import config_hash
+
+    panel_context = "" if config.context.mode == "diff-only" else context
+    payload = {
+        "cache_schema": CACHE_SCHEMA,
+        "package_version": __version__,
+        "prompt_version": prompts.PROMPT_VERSION,
+        "config_hash": config_hash(config),
+        "diff_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        "context_mode": config.context.mode,
+        "redact_secrets": config.context.redact_secrets,
+        "verify": config.verify,
+        "seed": seed if seed is not None else config.seed,
+        "mock": bool(mock),
+        "policy": _policy_fingerprint(policy),
+        "mode": mode,
+    }
+    if panel_context:
+        payload["context_sha256"] = hashlib.sha256(panel_context.encode("utf-8")).hexdigest()
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class TheHintsBlockIsPartOfTheKey(unittest.TestCase):
+    """Issue #745: the key folded in the ``hints`` *flag* but not the block.
+
+    ``--hints`` runs Ruff/ESLint over the changed paths and joins the result into
+    every Round 1 prompt. That block is a function of the **working tree**, not
+    of the diff or the config, so it is the one prompt input that changes while
+    every other input to this key stands still: fix a lint error anywhere the
+    linters can see, and the panel would have been shown something different
+    under a key that had not moved.
+    """
+
+    HINTS_A = "### Static analysis\n- src/example.py:1: E501 line too long\n"
+    HINTS_B = "### Static analysis\n- src/example.py:1: F401 unused import\n"
+
+    def test_two_hint_blocks_differing_only_in_text_key_differently(self):
+        self.assertNotEqual(
+            cache_key(_config(), SAMPLE_DIFF, hints=self.HINTS_A),
+            cache_key(_config(), SAMPLE_DIFF, hints=self.HINTS_B),
+        )
+
+    def test_the_same_hints_block_keys_the_same(self):
+        self.assertEqual(
+            cache_key(_config(), SAMPLE_DIFF, hints=self.HINTS_A),
+            cache_key(_config(), SAMPLE_DIFF, hints=self.HINTS_A),
+        )
+
+    def test_adding_a_hints_block_changes_the_key(self):
+        self.assertNotEqual(
+            cache_key(_config(), SAMPLE_DIFF),
+            cache_key(_config(), SAMPLE_DIFF, hints=self.HINTS_A),
+        )
+
+    def test_a_run_with_hints_off_keeps_its_key(self):
+        # The point of the conditional: `hints = false` is the default, so the
+        # payload of a run that produced no block must be byte-identical to the
+        # one it hashed before this key existed — with or without a block on the
+        # call. Under the default context mode that payload is also the pre-#738
+        # one, which is the strongest witness available.
+        cfg = _config()
+        self.assertFalse(cfg.hints)
+        old = _pre_738_key(cfg, SAMPLE_DIFF)
+        self.assertEqual(cache_key(cfg, SAMPLE_DIFF), old)
+        self.assertEqual(cache_key(cfg, SAMPLE_DIFF, hints=""), old)
+
+    def test_an_expanded_run_with_context_and_no_hints_keeps_its_key_too(self):
+        # The other shape a real `--pr` review has: context admitted by the mode,
+        # no block from the linters. Its entries are not invalidated either.
+        cfg = _expanded()
+        ctx = "## Summary\nAdds a parser.\n"
+        self.assertEqual(
+            cache_key(cfg, SAMPLE_DIFF, context=ctx),
+            _pre_745_key(cfg, SAMPLE_DIFF, context=ctx),
+        )
+
+    def test_the_block_is_keyed_under_every_context_mode(self):
+        # Unlike `context`, the block takes no mode filter: `run_jury` joins it
+        # into Round 1 *after* the "diff-only" filter (#715), precisely so the
+        # default mode cannot discard it. A key that filtered it would replay a
+        # stale review for every run that never asked for context.
+        for cfg in (_config(), _expanded()):
+            with self.subTest(mode=cfg.context.mode):
+                self.assertNotEqual(
+                    cache_key(cfg, SAMPLE_DIFF, hints=self.HINTS_A),
+                    cache_key(cfg, SAMPLE_DIFF, hints=self.HINTS_B),
+                )
+
+    def _cli_cache_state(self, cache_dir, block):
+        """Run the mock CLI with ``--hints --cache`` and report hit/miss.
+
+        The block reaches the key from the CALL SITE — ``cli`` resolves it from
+        ``collect_static_hints`` and hands the same string to ``cache_key`` and
+        to ``run_jury`` — so the linters are the seam patched here, and the
+        threading through the CLI is what is under test.
+        """
+        import contextlib
+        import io
+
+        from ai_jury import cli, hints
+
+        argv = ["--mock", "--diff-file", "-", "--hints", "--cache", "--cache-dir", str(cache_dir)]
+        err = io.StringIO()  # the progress log, where the hit/miss line lands
+        with (
+            unittest.mock.patch.object(cli, "_read_diff", return_value=(SAMPLE_DIFF, "")),
+            unittest.mock.patch.object(hints, "collect_static_hints", return_value=block),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            code = cli.main(argv)
+        self.assertEqual(code, 0)
+        text = err.getvalue()
+        self.assertTrue("cache hit" in text or "cache miss" in text, text)
+        return "cache hit" in text, "cache miss" in text
+
+    def test_a_changed_tree_is_a_cache_miss_end_to_end(self):
+        # The issue, reproduced through the CLI: the diff and the config are
+        # fixed and only the linters' answer moves, which is exactly the run the
+        # old key could not tell apart from the one before it.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._cli_cache_state(tmp, self.HINTS_A), (False, True))
+            self.assertEqual(self._cli_cache_state(tmp, self.HINTS_A), (True, False))
+            self.assertEqual(self._cli_cache_state(tmp, self.HINTS_B), (False, True))
+
+    def test_a_tree_the_linters_are_quiet_about_is_a_hit(self):
+        # `collect_static_hints` returns "" when the change touches nothing Ruff
+        # or ESLint handles, and a run with no block is the run that must keep
+        # its key — the `--hints` counterpart of `hints = false`.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._cli_cache_state(tmp, ""), (False, True))
+            self.assertEqual(self._cli_cache_state(tmp, ""), (True, False))
+
+    def test_the_hints_block_and_the_context_are_not_interchangeable(self):
+        # Two separate digests, not one concatenation: the same text arriving as
+        # a linter block and as a PR body is not the same run, and must not be
+        # able to collide by moving between the two parameters.
+        cfg = _expanded()
+        self.assertNotEqual(
+            cache_key(cfg, SAMPLE_DIFF, context=self.HINTS_A),
+            cache_key(cfg, SAMPLE_DIFF, hints=self.HINTS_A),
+        )
+
+
 class RoundTripTest(unittest.TestCase):
     def test_outcome_survives_serialization(self):
         outcome = run_jury(_config(), SAMPLE_DIFF, mock=True)
@@ -182,7 +486,7 @@ class CacheHitMissTest(unittest.TestCase):
             cache = Cache(tmp)
             key = "deadbeef"
             cache.dir.mkdir(parents=True, exist_ok=True)
-            (cache.dir / f"{key}.json").write_text("{}" + " " * (9 * 1024 * 1024))
+            (cache.dir / f"{key}.json").write_text("{}" + " " * (9 * 1024 * 1024), encoding="utf-8")
             self.assertIsNone(cache.load(key))
 
     def test_corrupt_entry_is_a_miss(self):
@@ -277,6 +581,54 @@ class CacheHitMissTest(unittest.TestCase):
             }  # no "mac" — a pre-#295 entry
             (cache.dir / f"{key}.json").write_text(json.dumps(entry), encoding="utf-8")
             self.assertIsNone(cache.load(key))
+
+    def test_a_record_written_before_the_model_field_is_not_read(self):
+        """#709, round 2: a format change is a miss, not a recomputation.
+
+        The stored record gained ``AgentResult.model`` — the id the invocation
+        sent — and the ballot reads it to justify ``model_source: requested``.
+        An entry written without the field cannot support that label, and
+        recomputing an id to fill the gap puts a derived value under a token
+        whose whole claim is that it came off the wire. So ``CACHE_SCHEMA``
+        refuses it: a cache exists to be an exact stand-in for a fresh run, and
+        where it cannot be, one re-run is the honest price.
+
+        The cache *key* does not settle this on its own. It invalidates every
+        pre-#709 entry in this release only because ``PROMPT_VERSION`` went 7 to
+        8 for #710 in the same change; had #709 landed alone, every existing
+        entry would have keyed identically and come back a field short.
+        """
+        from ai_jury import cache as cache_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Cache(tmp)
+            cfg = _config()
+            key = cache_key(cfg, SAMPLE_DIFF)
+            cache.dir.mkdir(parents=True, exist_ok=True)
+            outcome = outcome_to_dict(run_jury(cfg, SAMPLE_DIFF, mock=True))
+            for review in outcome["reviews"]:
+                del review["model"]  # the shape a pre-#709 writer produced
+            entry = {"cache_schema": 1, "cache_key": key, "outcome": outcome}
+            # Signed with the real key and stored under its own digest, so the
+            # schema is the ONLY reason this is a miss.
+            entry["mac"] = cache_mod._compute_mac(cache_mod._hmac_key(cache.dir), entry)
+            (cache.dir / f"{key}.json").write_text(json.dumps(entry), encoding="utf-8")
+            self.assertIsNone(cache.load(key))
+
+    def test_a_current_entry_round_trips_the_sent_model_id(self):
+        """The other half: what the bump protects is a field that really is read
+        back, so a fresh entry must carry it rather than being re-derived."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Cache(tmp)
+            cfg = _config()
+            key = cache_key(cfg, SAMPLE_DIFF)
+            outcome = run_jury(cfg, SAMPLE_DIFF, mock=True)
+            cache.store(key, outcome)
+            loaded = cache.load(key)
+            self.assertEqual(
+                [r.model for r in loaded.reviews],
+                [r.model for r in outcome.reviews],
+            )
 
     @unittest.skipIf(os.name == "nt", "POSIX permission semantics")
     def test_world_writable_dir_load_is_a_miss(self):

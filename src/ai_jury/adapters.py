@@ -25,8 +25,10 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from . import config as config_module
 from . import privilege, redaction
 from .config import AgentSpec
+from .findings import emitted_findings_block
 
 # Cap on a single local-model HTTP response body (issue #293/F-9). A chat
 # completion is small; an unbounded read from a malicious/buggy endpoint would
@@ -73,14 +75,30 @@ def _spawn(argv: list[str], stdin: str | None, timeout: int) -> subprocess.Compl
 
 
 def _read_only_extra_args(spec: AgentSpec) -> list[str]:
-    """The agent's ``extra_args`` with its mandatory read-only sandbox guaranteed.
+    """The agent's ``extra_args`` with the read-only sandbox added when none is named.
 
-    Enforced at the adapter layer (issue #288) so a missing/misconfigured
-    ``extra_args`` cannot strip the sandbox: a reviewer of an attacker-controlled
-    diff is never write/tool-capable. Config may widen a codex sandbox knowingly,
-    but never remove the restriction.
+    Enforced at the adapter layer (issue #288) so an **empty** ``extra_args`` cannot
+    produce a write-capable reviewer of an attacker-controlled diff. It injects; it
+    does not override. A config that names its own sandbox keeps it — ``-s
+    workspace-write`` is passed through as written — codex's bypass flags are passed
+    through too, and the ``cli``/``xai`` adapters have no enforcement at all. Those
+    are the cases :func:`ai_jury.privilege.audit_agent` reports and ``--strict``
+    fails on (#750); this function is not the guarantee on its own.
     """
-    return privilege.enforce_read_only(spec.vendor, spec.name, spec.extra_args)
+    # Keyed on the ADAPTER, not the vendor (issue #705): the sandbox flag is a
+    # property of the CLI being spawned, not of whose model answers. A seat with
+    # `vendor = "openai", adapter = "cli", command = "cursor-agent"` must not have
+    # codex's `-s read-only` spliced into an unrelated binary.
+    return privilege.enforce_read_only(config_module.spec_adapter(spec), spec.extra_args)
+
+
+def _write_extra_args(spec: AgentSpec) -> list[str]:
+    """The agent's ``extra_args`` with its vendor write/tool mode enabled (#661).
+
+    Reached ONLY from ``jury run-agent --role implement|fix --allow-write``, via
+    :meth:`Adapter.build_write_argv`. Nothing on the panel path calls it.
+    """
+    return privilege.enable_write(config_module.spec_adapter(spec), spec.extra_args)
 
 
 # Short timeout for capability/version probes. Detection is best-effort and must
@@ -118,6 +136,15 @@ ERR_MISSING_API_KEY = "missing_api_key"
 # letting http.client raise (and risk echoing a transformed/escaped copy of
 # the secret in its exception text — see _HostedApiAdapter._invalid_key_reason).
 ERR_INVALID_API_KEY = "invalid_api_key"
+# The agent exited 0 and printed something, but that something is not a review
+# (issue #682): a refusal, or the CLI's own usage/argument-error/version banner
+# echoed back because the invocation never reached the model. Distinct from
+# ERR_EMPTY_OUTPUT (nothing at all on stdout) so a report can tell "the CLI is
+# broken/misinvoked" apart from "the model declined", and distinct from ok=True
+# so neither can be counted as a vendor that contributed to consensus. #635 is
+# the shape: `agy` passed every availability probe, printed an argument error,
+# and the panel silently became single-vendor.
+ERR_NO_REVIEW = "no_review"
 ERR_UNKNOWN = "unknown"
 
 ERROR_CODES = frozenset(
@@ -133,6 +160,7 @@ ERROR_CODES = frozenset(
         ERR_CONNECTION,
         ERR_MISSING_API_KEY,
         ERR_INVALID_API_KEY,
+        ERR_NO_REVIEW,
         ERR_UNKNOWN,
     }
 )
@@ -141,7 +169,8 @@ ERROR_CODES = frozenset(
 # #30): a timeout, a rate-limit, a process that failed to spawn, or a local
 # server that was briefly unreachable (#43). Auth, missing-CLI,
 # permission-prompt, empty-output, and generic nonzero-exit are treated as
-# deterministic — retrying them just burns time and tokens.
+# deterministic — retrying them just burns time and tokens. So is a
+# no-review output: a misinvoked CLI prints the same usage banner every time.
 RETRYABLE_ERROR_CODES = frozenset(
     {
         ERR_TIMEOUT,
@@ -208,6 +237,452 @@ def classify_stderr(returncode: int, stderr: str) -> str:
     return ERR_NONZERO_EXIT
 
 
+# --- "Exit 0, but nothing reviewable came back" (issue #682) ------------------
+#
+# A CLI that exits 0 and prints its own usage text is indistinguishable, to
+# everything downstream, from a reviewer that read the diff — the run stays
+# fail-soft and the panel quietly loses a vendor (#635). These patterns turn
+# that into a typed failure at the adapter boundary, on SHAPE alone: never on
+# whether a review is any good, only on whether it is a review at all.
+
+#: An output longer than this is treated as a review even if it opens with a
+#: refusal-shaped sentence. A real review that mentions "I cannot verify X"
+#: mid-argument must never be discarded; an actual refusal is a short paragraph.
+_NO_REVIEW_MAX_CHARS = 600
+
+#: How much of the output is examined for a usage/argument-error banner. A CLI
+#: that is going to print one prints it first.
+_NO_REVIEW_HEAD_CHARS = 400
+
+# The #635 class: the launcher rejected the argv, so the model was never
+# reached. Every one of these is text a CLI writes about ITSELF — and the whole
+# difficulty is that a review may *talk about* the same words. "Usage of int()
+# is unsafe" and "Invalid argument passed to calculate_total()" are findings,
+# not banners, and discarding either costs a panelist and (with the guard
+# failing closed) can collapse the panel. So each pattern below is matched
+# against a whole line, and every branch is bounded the way the refusal branch
+# already is: a banner is short, or it is corroborated by banner structure.
+
+#: A launcher's own usage line, as a whole line. Prose that merely opens with
+#: the word "usage" does not match: the line must go on to look like a synopsis
+#: (a colon, or a bracketed/flag-shaped operand).
+_USAGE_LINE_RE = re.compile(
+    r"usage:\s*\S"  # "Usage: agy [options] [prompt]"
+    r"|usage\s+of\s+\S+:$"  # Go's flag package: "Usage of ./agy:"
+    r"|usage\s+\S+\s+[\[<-]",  # "usage agy [options]"
+    re.IGNORECASE,
+)
+
+#: Text only a launcher writes about itself — it complains about the argv it
+#: was handed, in the first person of a program. Needs no corroboration beyond
+#: opening a short output.
+_CLI_SELF_ERROR_RE = re.compile(
+    r"(?:error|fatal)\s*:\s*(?:unknown|unrecognized|invalid|unexpected)\s+"
+    r"(?:flag|option|argument|command|subcommand)\b"
+    r"|flag needs an argument\b"
+    r"|.{0,40}\bcommand not found$",
+    re.IGNORECASE,
+)
+
+#: The same complaint without the ``error:`` prefix. This one IS ambiguous with
+#: review prose, so it must both name a flag-shaped token ("unknown flag:
+#: --print") and be corroborated by surrounding banner structure.
+_BARE_ARG_ERROR_RE = re.compile(
+    r"(?:unknown|unrecognized|invalid|unexpected)\s+"
+    r"(?:flag|option|argument|command|subcommand)\b"
+    r"[\s:=]*[\"'`]?-{1,2}[A-Za-z0-9]",
+    re.IGNORECASE,
+)
+
+#: Corroborating structure, never a trigger on its own: the options/flags block
+#: under a synopsis, or the help hint a launcher prints beneath it. The old
+#: unanchored "for more information, try/see" pattern lives on only here — it
+#: is a sentence a review can perfectly well contain.
+_BANNER_STRUCTURE_RE = re.compile(
+    r"^[ \t]*(?:options|flags|commands|arguments|subcommands)\b[ \t]*:?[ \t]*$"
+    r"|^[ \t]*-{1,2}[A-Za-z0-9][\w-]*(?:[ \t=,]|$)"
+    r"|^[ \t]*for more information,? (?:try|see)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: Nothing but a version/probe banner, e.g. "1.1.22" or "agy version 1.1.22".
+_VERSION_ONLY_RE = re.compile(r"^[\w.@/+-]{0,40}(?:\s+version)?\s*v?\d+\.\d+[\w.+-]*$")
+
+#: A refusal, matched on the lowercased text and only inside the length bound
+#: above. Deliberately narrow: these are first-person declines, not any
+#: sentence containing the word "cannot".
+#:
+#: Matching this is NOT on its own enough to discard an output — see
+#: :func:`_is_whole_output_refusal`. A reviewer routinely opens with a limit it
+#: hit ("I do not have access to the migration file, so I reviewed the Python
+#: only: …") and then reviews; discarding that costs a panelist and, with the
+#: gate failing closed, turns a passing two-vendor run into exit 3.
+_REFUSAL_RE = re.compile(
+    r"i(?:'|\u2019)?m (?:sorry|unable|not able)"
+    r"|i am (?:sorry|unable|not able)"
+    r"|i (?:can(?:'|\u2019)?t|cannot|won(?:'|\u2019)?t|will not)"
+    r" (?:help|assist|do|review|comply|provide|analyz|analys)"
+    r"|sorry,? (?:but )?i "
+    r"|as an ai\b"
+    r"|i (?:do not|don(?:'|\u2019)?t) have (?:access|the ability)"
+)
+
+
+#: How far into the output a decline may begin and still BE the output. A
+#: refusal says so first; a review that ran into a limit mid-argument says so
+#: after paragraphs of review. One short lead-in sentence is allowed for, no more.
+_REFUSAL_OPENING_CHARS = 80
+
+#: Marks of an output that reviewed something, however briefly. Any one of them
+#: outranks the refusal phrase in front of it: an agent that says it could not
+#: read one file and then names a defect HAS reviewed, and its finding is the
+#: thing the panel exists to collect.
+_REVIEW_SUBSTANCE_RE = re.compile(
+    r"\blines?\s+\d+"  # "line 12", "lines 40-52"
+    r"|\b[\w./-]+\.[a-z]{1,5}:\d+"  # "src/app.py:12"
+    r"|^@@[ \t]"  # a hunk header quoted back
+    r"|\bi (?:reviewed|read|checked|examined|inspected|looked at|went through)\b"
+    r"|\b(?:having|after) (?:reviewed|read|checked|examined)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: The adversative pivot that turns a limit into a review: "I'm not able to
+#: reproduce the race locally, BUT the lock ordering here is wrong." It counts
+#: only when what follows is prose of its own and is not itself another decline
+#: — "I'm sorry, but I can't help with this" pivots into the same refusal.
+_PIVOT_RE = re.compile(r"\b(?:but|however|though|although|that said)\b", re.IGNORECASE)
+
+#: How much text must follow a pivot before it can carry a review claim.
+_PIVOT_MIN_CHARS = 20
+
+
+def _carries_review_substance(body: str) -> bool:
+    """True when ``body`` says something about the code, not only about itself."""
+    if _REVIEW_SUBSTANCE_RE.search(body):
+        return True
+    pivot = _PIVOT_RE.search(body)
+    if pivot is None:
+        return False
+    rest = body[pivot.end() :].strip()
+    return len(rest) >= _PIVOT_MIN_CHARS and _REFUSAL_RE.search(rest.lower()) is None
+
+
+def _is_whole_output_refusal(body: str) -> bool:
+    """True when the output *is* a decline, not a review that mentions a limit.
+
+    Three conditions, all necessary. The output is short (a real decline is a
+    sentence or two), the decline OPENS it, and nothing in it carries review
+    substance. Merely containing a refusal phrase somewhere inside the length
+    bound was the old rule, and it destroyed genuine short reviews — including
+    ones that named a defect and a line number (#682, round 3).
+    """
+    if len(body) > _NO_REVIEW_MAX_CHARS:
+        return False
+    match = _REFUSAL_RE.search(body.lower())
+    if match is None or match.start() > _REFUSAL_OPENING_CHARS:
+        return False
+    return not _carries_review_substance(body)
+
+
+def _is_cli_banner(body: str) -> bool:
+    """True when ``body`` *is* a launcher's banner, not prose that mentions one.
+
+    Two shapes qualify. A full help dump — a synopsis line plus an options
+    block — is unmistakable at any length. Anything shorter must both open with
+    a banner-shaped line and fit inside the same length bound the refusal branch
+    uses: a real review is not three lines.
+    """
+    head = body[:_NO_REVIEW_HEAD_CHARS]
+    lines = [line.strip() for line in head.splitlines() if line.strip()]
+    if not lines:  # pragma: no cover - `body` is stripped and non-empty here
+        return False
+    synopsis = any(_USAGE_LINE_RE.match(line) for line in lines)
+    structure = _BANNER_STRUCTURE_RE.search(head) is not None
+    if synopsis and structure:
+        return True
+    if len(body) > _NO_REVIEW_MAX_CHARS:
+        return False
+    first = lines[0]
+    if _USAGE_LINE_RE.match(first) or _CLI_SELF_ERROR_RE.match(first):
+        return True
+    return _BARE_ARG_ERROR_RE.match(first) is not None and (synopsis or structure)
+
+
+def no_review_reason(text: str) -> str | None:
+    """Why ``text`` cannot be a review, or ``None`` when it could be one.
+
+    PURE, and a judgement of SHAPE only — it never scores a review's quality.
+    An adapter calls it on an exit-0 stdout so that a refusal, a usage banner
+    or a bare version string is recorded as a typed failure (``ERR_NO_REVIEW``)
+    rather than as a contributing vendor. Fail-soft still applies: the run
+    continues, but with a dead seat that says so.
+
+    Returns a short human-readable reason, safe to embed in an error string
+    (it names the category, never the agent's text).
+    """
+    body = (text or "").strip()
+    if not body:
+        return "the agent produced no output"
+    # A structured findings block is the one machine-checkable proof that the
+    # agent answered in the reviewer's contract, and it settles the question
+    # before any prose heuristic gets a vote: a launcher banner does not emit
+    # one, and an agent that declines and then reports a finding has reviewed.
+    if emitted_findings_block(body):
+        return None
+    if _is_cli_banner(body):
+        return "the CLI printed usage or argument-error text instead of a review"
+    if _VERSION_ONLY_RE.match(body):
+        return "the CLI printed only a version banner instead of a review"
+    if _is_whole_output_refusal(body):
+        return "the agent declined to review"
+    return None
+
+
+# --- Reasoning effort (issue #662) -------------------------------------------
+#
+# Every vendor expresses "think harder" differently, so the mapping lives HERE,
+# in one pure function, instead of being spread across the adapters: agy encodes
+# effort as a model-id suffix, the Anthropic Messages API takes an extended-
+# thinking token budget, OpenAI-shaped APIs take `reasoning_effort`, Gemini takes
+# a `thinkingConfig` budget, and the `claude`/`codex` CLIs have no headless knob
+# at all. `effort_args` is the single place any of that is decided.
+
+#: The effort levels accepted by ``[[agent]] effort`` and ``--effort``.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+
+# Anthropic extended-thinking budgets (tokens) per level, before clamping.
+_ANTHROPIC_THINKING_BUDGET = {"low": 2048, "medium": 8192, "high": 32768}
+# Ceiling on the `max_tokens` this project will ever request from Anthropic.
+# Thinking tokens are drawn from the same allowance, so `max_tokens` has to
+# exceed the budget — but per-model caps vary and an unbounded sum would build a
+# request some models reject outright. 32000 sits inside every current model's
+# limit, so the `high` budget is clamped to `ceiling - _HOSTED_API_MAX_TOKENS`
+# (27904) rather than sending its nominal 32768. Documented in
+# docs/configuration.md.
+_ANTHROPIC_MAX_TOKENS_CEILING = 32000
+# Gemini `thinkingConfig.thinkingBudget` (tokens) per level.
+_GEMINI_THINKING_BUDGET = {"low": 1024, "medium": 8192, "high": 32768}
+# agy model-id suffixes that already carry an effort level.
+_AGY_MODEL_SUFFIXES = tuple(f"-{level}" for level in EFFORT_LEVELS)
+
+# Vendors that can actually act on an effort level. Everything else (the
+# `claude`/`codex` CLIs, `local`, `cli`, any unregistered vendor) warns once and
+# ignores it: a local OpenAI-compatible server is NOT included, because many of
+# them reject an unknown request field outright, which would turn a hint into a
+# failed review.
+_EFFORT_VENDORS = frozenset(
+    {"google", "anthropic-api", "openai-api", "xai-api", "openai-compatible", "google-api"}
+)
+
+
+@dataclass(frozen=True)
+class EffortPlan:
+    """How one vendor expresses a reasoning-effort level.
+
+    ``model`` is a replacement model id (agy, which encodes effort in the id);
+    ``payload`` is a request-body fragment to merge into the vendor's JSON body;
+    ``warning`` is the once-per-run operator message when the level is ignored.
+    """
+
+    supported: bool = True
+    model: str | None = None
+    payload: dict = field(default_factory=dict)
+    warning: str | None = None
+
+
+def effort_supported(vendor: str) -> bool:
+    """Whether *vendor* can act on an effort level at all (pure)."""
+    return config_module.normalise_vendor(vendor) in _EFFORT_VENDORS
+
+
+def _anthropic_budget(level: str) -> int:
+    """Thinking budget for *level*, clamped to the documented ceiling (pure)."""
+    return min(
+        _ANTHROPIC_THINKING_BUDGET[level],
+        _ANTHROPIC_MAX_TOKENS_CEILING - _HOSTED_API_MAX_TOKENS,
+    )
+
+
+def _effort_uses_model_listing(vendor: str) -> bool:
+    """Whether *vendor* expresses effort through the model id (pure).
+
+    Those are the vendors whose mapped id can be checked against what the CLI
+    actually offers, so callers know when discovering a listing is worth a probe.
+    """
+    return config_module.normalise_vendor(vendor) == "google"
+
+
+def effort_args(
+    vendor: str,
+    effort: str | None,
+    model: str | None = None,
+    known_models: list[str] | None = None,
+) -> EffortPlan:
+    """Map ``(vendor, effort, model)`` to the vendor's own effort knob (pure).
+
+    An empty/None *effort* is a no-op plan. An unrecognized level raises
+    ``ValueError`` — ``config.validate_config`` and the ``--effort`` choices
+    already gate user input, so reaching here with garbage is a programming
+    error, not something to silently swallow.
+
+    ``known_models``, when the caller has discovered one, is the model listing
+    the vendor actually offers. It is only consulted where effort is expressed
+    *as* a model id (agy): sending a suffixed id the CLI does not have would
+    fail the whole review, so an unlisted mapping falls back to the configured
+    id and warns instead. ``None`` means "no listing available" — the check is
+    skipped, never guessed.
+    """
+    level = (effort or "").strip().lower()
+    if not level:
+        return EffortPlan()
+    if level not in EFFORT_LEVELS:
+        raise ValueError(f"unknown effort {effort!r}; expected one of {', '.join(EFFORT_LEVELS)}")
+
+    name = config_module.normalise_vendor(vendor)
+
+    if name == "google":
+        # The `agy` CLI selects effort through the model id itself.
+        current = (model or "").strip()
+        if not current:
+            return EffortPlan(
+                warning=(
+                    f"effort '{level}' needs a configured model for vendor '{vendor}' "
+                    f"(effort is encoded in the model id), ignored"
+                )
+            )
+        if current.endswith(_AGY_MODEL_SUFFIXES):
+            # Already pinned by the operator; an explicit model id wins.
+            return EffortPlan(model=current)
+        suffixed = f"{current}-{level}"
+        if known_models is not None and suffixed not in known_models:
+            # Better a review at the configured depth than no review at all.
+            return EffortPlan(
+                model=current,
+                warning=(
+                    f"effort '{level}' maps model '{current}' to '{suffixed}', which "
+                    f"vendor '{vendor}' does not offer; using '{current}' unchanged"
+                ),
+            )
+        return EffortPlan(model=suffixed)
+
+    if name == "anthropic-api":
+        return EffortPlan(
+            payload={
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": _anthropic_budget(level),
+                }
+            }
+        )
+
+    if name in ("openai-api", "xai-api", "openai-compatible"):
+        return EffortPlan(payload={"reasoning_effort": level})
+
+    if name == "google-api":
+        return EffortPlan(
+            payload={
+                "generationConfig": {
+                    "thinkingConfig": {"thinkingBudget": _GEMINI_THINKING_BUDGET[level]}
+                }
+            }
+        )
+
+    return EffortPlan(supported=False, warning=f"effort unsupported for {vendor}, ignored")
+
+
+def effort_warnings(agents, adapter_factory=None) -> list[str]:
+    """Deduped, ordered effort warnings for a panel — one message per run.
+
+    Callers (the CLI) print these once before the run rather than once per agent
+    invocation, so a three-round panel does not repeat the same line nine times.
+
+    Pure unless *adapter_factory* is given. With it, an agent whose effort is
+    expressed as a model id has its mapped id checked against the vendor's real
+    listing, so "that model does not exist" is reported up front instead of
+    surfacing as an abstention mid-run. The probe is skipped entirely for agents
+    with no effort configured and for every other vendor, and any failure
+    degrades to "no listing" rather than blocking the run.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for spec in agents:
+        # The adapter, not the vendor (#705): how effort is expressed — a model
+        # suffix, a request-body field, nothing at all — is a property of the
+        # protocol the seat is invoked through.
+        vendor = config_module.spec_adapter(spec)
+        effort = getattr(spec, "effort", None)
+        known_models = None
+        if adapter_factory is not None and effort and _effort_uses_model_listing(vendor):
+            try:
+                known_models = adapter_factory(spec).list_models()
+            except Exception:  # noqa: BLE001 - discovery is best-effort
+                known_models = None
+        try:
+            plan = effort_args(
+                vendor,
+                effort,
+                getattr(spec, "model", None),
+                known_models=known_models,
+            )
+        except ValueError as exc:
+            message = str(exc)
+        else:
+            message = plan.warning
+        if message and message not in seen:
+            seen.add(message)
+            out.append(message)
+    return out
+
+
+# Model ids look like `gemini-3.8-flash`, `qwen2.5-coder:7b`, `anthropic/claude-x`.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+# Cap a discovered model listing so a chatty/hostile CLI cannot flood diagnostics.
+_MAX_LISTED_MODELS = 50
+
+
+def parse_model_list(raw: str) -> list[str]:
+    """Model ids out of a CLI's model listing (pure, best-effort, order-preserving).
+
+    Accepts either JSON (a list, or an object with ``models``/``data``) or plain
+    lines, because a CLI's listing format is not a contract. Anything that does
+    not look like a model id is dropped rather than guessed at.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+
+    ids: list[str] = []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        data = data.get("models") or data.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                ids.append(item)
+            elif isinstance(item, dict):
+                value = item.get("id") or item.get("name") or item.get("model")
+                if isinstance(value, str):
+                    ids.append(value)
+    else:
+        for line in text.splitlines():
+            token = line.strip().lstrip("-*\u2022").strip()
+            token = token.split()[0] if token else ""
+            if _MODEL_ID_RE.match(token):
+                ids.append(token)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in ids:
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out[:_MAX_LISTED_MODELS]
+
+
 @dataclass
 class AgentResult:
     agent: str
@@ -227,6 +702,19 @@ class AgentResult:
     # produced no review emits prose and no block. Without this, both arrive as zero
     # findings and the panel reports the same size either way.
     structured: bool = False
+    # The agent process's own exit status (issue #661), or None when there was
+    # no process to exit: a network adapter, a CLI that was never spawned
+    # (missing on PATH, spawn failure), or one killed on timeout. `jury
+    # run-agent` reports it so an orchestrator can act on the real status
+    # instead of parsing it back out of the error string.
+    exit_code: int | None = None
+    # The model id this invocation actually sent (issue #709), stamped by the
+    # path that ran the adapter from :meth:`Adapter.resolved_model` — the same
+    # call that put the id in the argv/payload. Empty when nothing was pinned
+    # (the CLI chose) or when the record was not produced by an invocation.
+    # A ballot READS this rather than re-deriving it: `vendor` and `adapter` can
+    # differ since #705, and a second derivation is a second answer.
+    model: str = ""
 
 
 class Adapter:
@@ -255,6 +743,36 @@ class Adapter:
     def build_argv(self, prompt: str) -> list[str]:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    def build_write_argv(self, prompt: str) -> list[str]:
+        """Argv for a WRITE-capable invocation of this CLI (issue #661).
+
+        The default is the read-only argv: a vendor with no tool-enabled mode
+        (and every network adapter, which has no tools at all) simply cannot
+        widen, and failing closed is the right default. The three native CLI
+        adapters override it.
+        """
+        return self.build_argv(prompt)
+
+    def build_argv_for_role(self, prompt: str, policy=None) -> list[str]:
+        """Argv for one ``jury run-agent`` role (issue #661).
+
+        The single seam between the role policy and an adapter's argv, so the
+        policy is never re-decided inside :meth:`run`. ``policy=None`` — every
+        panel invocation — resolves to the unchanged read-only :meth:`build_argv`,
+        which is why adding this could not alter an existing run.
+
+        Both branches end in :meth:`build_argv`, which the base class leaves
+        ``NotImplementedError``. That is not reachable through a real run: every
+        adapter that spawns a subprocess implements it, and the ones that do not
+        (``LocalAdapter`` and the hosted-API adapters) build no argv at all —
+        they override :meth:`run` and never call this. A new subprocess adapter
+        that forgets ``build_argv`` therefore fails loudly on its first
+        invocation rather than running with an empty command line.
+        """
+        if policy is None or not getattr(policy, "write", False):
+            return self.build_argv(prompt)
+        return self.build_write_argv(prompt)
+
     def _stdin_for(self, prompt: str) -> str | None:
         """Prompt to feed on stdin, or None to pass it in argv (the default)."""
         del prompt
@@ -271,6 +789,53 @@ class Adapter:
     def _version_argv(self) -> list[str]:
         """Argv used to probe the CLI's version."""
         return [self.spec.command, *self._VERSION_ARGS]
+
+    def effort_plan(self) -> EffortPlan:
+        """This agent's resolved effort mapping (see :func:`effort_args`).
+
+        An invalid level degrades to a no-op plan here: a run must not crash on
+        a bad config value that ``validate_config`` is responsible for rejecting.
+        """
+        try:
+            return effort_args(
+                config_module.spec_adapter(self.spec),
+                getattr(self.spec, "effort", None),
+                self.spec.model,
+            )
+        except ValueError:
+            return EffortPlan()
+
+    def resolved_model(self) -> str:
+        """The model id this adapter sends, byte-for-byte (issue #709).
+
+        **The** answer to "which model was asked for", and the only one: every
+        place a model id leaves this module — the ``--model``/``-m`` argv of the
+        three CLI adapters, the ``model`` field of every network payload, the
+        Gemini URL — reads it from here, and :attr:`AgentResult.model` records
+        what it returned so a ballot can quote the id instead of deriving a
+        second one.
+
+        That second derivation was the defect. :func:`effort_args` is keyed on
+        the **adapter**, because how effort is expressed is a property of the
+        protocol a seat is invoked through; ``ai_jury.ballots.requested_model``
+        keyed it on the ``vendor``, and since #705 those can differ, so a seat
+        with ``vendor = google, adapter = cli`` was invoked with ``gemini-3-pro``
+        while its ballot reported ``gemini-3-pro-high`` under
+        ``model_source: requested`` — a field whose whole claim is that it is the
+        id actually sent. The subclass that consults a live model listing
+        (:class:`AgyAdapter`) overrides :meth:`effort_plan`, not this, so the
+        fallback it resolves is recorded here too.
+        """
+        return (self.effort_plan().model or self.spec.model or "").strip()
+
+    def list_models(self) -> list[str] | None:
+        """Model ids this agent could be pointed at, or None when unknown.
+
+        Diagnostics only (``jury --doctor --json``). The default is None — most
+        CLIs have no listing command — and every override is time-boxed and
+        fail-soft, because doctor must never hang or crash on a probe.
+        """
+        return None
 
     def detect_capabilities(self) -> dict:
         """Best-effort probe of this agent's version and capabilities.
@@ -336,7 +901,13 @@ class Adapter:
             )
         return caps
 
-    def run(self, prompt: str, phase: str = "review", timeout: int | None = None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        phase: str = "review",
+        timeout: int | None = None,
+        role_policy=None,
+    ) -> AgentResult:
         del phase
         if not self.available():
             return AgentResult(
@@ -353,7 +924,7 @@ class Adapter:
         effective_timeout = self.spec.timeout
         if timeout is not None:
             effective_timeout = max(1, min(self.spec.timeout, int(timeout)))
-        argv = self.build_argv(prompt)
+        argv = self.build_argv_for_role(prompt, role_policy)
         stdin = self._stdin_for(prompt)
         start = time.monotonic()
         try:
@@ -403,6 +974,7 @@ class Adapter:
                 dur,
                 f"exit {proc.returncode}: {safe_detail[:500]}",
                 error_code=classify_stderr(proc.returncode, stderr or out),
+                exit_code=proc.returncode,
             )
         if not out:
             # Exit 0 but nothing on stdout: the agent produced no usable review.
@@ -414,8 +986,24 @@ class Adapter:
                 dur,
                 f"exit {proc.returncode}: empty output",
                 error_code=ERR_EMPTY_OUTPUT,
+                exit_code=proc.returncode,
             )
-        return AgentResult(self.name, self.spec.vendor, True, out, dur)
+        # Exit 0 with output that is not a review (issue #682): a refusal, or the
+        # CLI's own usage/version banner because the argv never reached the model
+        # (#635). Counting it as a review is what makes a panel collapse silent.
+        no_review = no_review_reason(out)
+        if no_review is not None:
+            return AgentResult(
+                self.name,
+                self.spec.vendor,
+                False,
+                "",
+                dur,
+                f"no review returned: {no_review}: {redaction.redact(out)[0][:200]}",
+                error_code=ERR_NO_REVIEW,
+                exit_code=proc.returncode,
+            )
+        return AgentResult(self.name, self.spec.vendor, True, out, dur, exit_code=proc.returncode)
 
 
 class ClaudeAdapter(Adapter):
@@ -423,12 +1011,21 @@ class ClaudeAdapter(Adapter):
     # STDIN rather than as a process argument so it is not exposed in `ps` /
     # /proc/<pid>/cmdline to other local users (issue #287). `claude -p` reads
     # the prompt from stdin when no positional prompt is given.
+    def _head_argv(self) -> list[str]:
+        argv = [self.spec.command, "-p"]
+        model = self.resolved_model()
+        if model:
+            argv += ["--model", model]
+        return argv
+
     def build_argv(self, prompt: str) -> list[str]:
         del prompt
-        argv = [self.spec.command, "-p"]
-        if self.spec.model:
-            argv += ["--model", self.spec.model]
-        return argv + _read_only_extra_args(self.spec)
+        return self._head_argv() + _read_only_extra_args(self.spec)
+
+    def build_write_argv(self, prompt: str) -> list[str]:
+        """Implementer invocation: the CLI's own tool set, no deny list (#661)."""
+        del prompt
+        return self._head_argv() + _write_extra_args(self.spec)
 
     def _stdin_for(self, prompt: str) -> str | None:
         return prompt
@@ -439,12 +1036,21 @@ class CodexAdapter(Adapter):
     # waiting for input in non-interactive runs. Sandbox flags live in extra_args;
     # the shipped default is ``-s read-only`` (secure by default, #100) — the
     # reviewer only reads its prompt, since the jury fetches the diff via ``gh``.
+    def _head_argv(self) -> list[str]:
+        argv = [self.spec.command, "exec"]
+        model = self.resolved_model()
+        if model:
+            argv += ["-m", model]
+        return argv
+
     def build_argv(self, prompt: str) -> list[str]:
         del prompt
-        argv = [self.spec.command, "exec"]
-        if self.spec.model:
-            argv += ["-m", self.spec.model]
-        return argv + _read_only_extra_args(self.spec)
+        return self._head_argv() + _read_only_extra_args(self.spec)
+
+    def build_write_argv(self, prompt: str) -> list[str]:
+        """Implementer invocation: ``-s workspace-write`` instead of read-only (#661)."""
+        del prompt
+        return self._head_argv() + _write_extra_args(self.spec)
 
     def _stdin_for(self, prompt: str) -> str | None:
         return prompt
@@ -469,12 +1075,63 @@ class AgyAdapter(Adapter):
     # problem. Verified end to end against agy 1.1.22.
     _STREAM_ARGS = ("--input-format", "stream-json", "--output-format", "stream-json")
 
+    # `agy models` lists the model ids the CLI can be pointed at.
+    _MODELS_ARGS = ("models",)
+
+    def effort_plan(self) -> EffortPlan:
+        """agy's effort IS the model id, so check the mapping against its listing.
+
+        The listing is probed at most once per adapter instance, and only when an
+        effort level is actually configured — a run without one pays nothing,
+        which matters because this is on the per-invocation path.
+        """
+        if not getattr(self.spec, "effort", None):
+            return EffortPlan()
+        try:
+            return effort_args(
+                config_module.spec_adapter(self.spec),
+                self.spec.effort,
+                self.spec.model,
+                known_models=self._cached_model_listing(),
+            )
+        except ValueError:
+            return EffortPlan()
+
+    def _cached_model_listing(self) -> list[str] | None:
+        """``agy models``, memoized per adapter instance."""
+        if not hasattr(self, "_model_listing"):
+            self._model_listing = self.list_models()
+        return self._model_listing
+
+    def _head_argv(self) -> list[str]:
+        argv = [self.spec.command, *self._STREAM_ARGS]
+        # agy encodes reasoning effort in the model id (`…-flash` -> `…-flash-high`),
+        # so effort changes WHICH model is selected rather than adding a flag.
+        model = self.resolved_model()
+        if model:
+            argv += ["--model", model]
+        return argv
+
     def build_argv(self, prompt: str) -> list[str]:
         del prompt
-        argv = [self.spec.command, *self._STREAM_ARGS]
-        if self.spec.model:
-            argv += ["--model", self.spec.model]
-        return argv + _read_only_extra_args(self.spec)
+        return self._head_argv() + _read_only_extra_args(self.spec)
+
+    def build_write_argv(self, prompt: str) -> list[str]:
+        """Implementer invocation: drop the boolean ``--sandbox`` (#661)."""
+        del prompt
+        return self._head_argv() + _write_extra_args(self.spec)
+
+    def list_models(self) -> list[str] | None:
+        """Model ids from ``agy models`` (time-boxed, fail-soft; issue #662)."""
+        if not self.available():
+            return None
+        try:
+            proc = _spawn([self.spec.command, *self._MODELS_ARGS], None, _VERSION_PROBE_TIMEOUT)
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            return None
+        if proc.returncode != 0:
+            return None
+        return parse_model_list(proc.stdout or "") or None
 
     def _stdin_for(self, prompt: str) -> str | None:
         """One NDJSON frame carrying the prompt. Shape verified against 1.1.22."""
@@ -625,7 +1282,7 @@ class LocalAdapter(Adapter):
     def build_payload(self, prompt: str) -> dict:
         """Build the OpenAI-compatible chat-completions request body (pure)."""
         return {
-            "model": self.spec.model or "",
+            "model": self.resolved_model(),
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "temperature": 0,
@@ -655,8 +1312,9 @@ class LocalAdapter(Adapter):
         Probes the OpenAI-compatible ``/v1/models`` (or the endpoint root) with a
         short timeout. Network-only; never raises.
         """
+        # Only `urllib.error` here: the request itself goes through `_open`, whose
+        # `_http_only_opener` imports `urllib.request` for it.
         import urllib.error
-        import urllib.request
 
         url = f"{self.endpoint}/models"
         try:
@@ -667,6 +1325,10 @@ class LocalAdapter(Adapter):
             return exc.code < 500
         except Exception:  # noqa: BLE001 - unreachable server -> not available
             return False
+
+    def list_models(self) -> list[str] | None:
+        """Model ids the local server advertises, or None when it has none."""
+        return list_local_models(self.endpoint) or None
 
     def detect_capabilities(self) -> dict:
         reachable = self.available()
@@ -679,12 +1341,21 @@ class LocalAdapter(Adapter):
             "warnings": ([] if reachable else [f"local server unreachable at {self.endpoint}"]),
         }
 
-    def run(self, prompt: str, phase: str = "review", timeout: int | None = None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        phase: str = "review",
+        timeout: int | None = None,
+        role_policy=None,
+    ) -> AgentResult:
         import json as _json
         import urllib.error
         import urllib.request
 
         del phase
+        # A network adapter has no tools, no shell and no filesystem, so a
+        # write-enabled role changes nothing about how it is invoked (#661).
+        del role_policy
         effective_timeout = self.spec.timeout
         if timeout is not None:
             effective_timeout = max(1, min(self.spec.timeout, int(timeout)))
@@ -760,6 +1431,17 @@ class LocalAdapter(Adapter):
                 "local model returned empty content",
                 error_code=ERR_EMPTY_OUTPUT,
             )
+        no_review = no_review_reason(content)
+        if no_review is not None:
+            return AgentResult(
+                self.name,
+                self.spec.vendor,
+                False,
+                "",
+                dur,
+                f"no review returned: {no_review}",
+                error_code=ERR_NO_REVIEW,
+            )
         return AgentResult(self.name, self.spec.vendor, True, content, dur)
 
 
@@ -770,6 +1452,7 @@ class LocalAdapter(Adapter):
 _ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_API_VERSION = "2023-06-01"
 _OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+_XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 # The Anthropic Messages API requires max_tokens on every request; there is no
 # server-side default. Generous enough for a review response, small enough to
 # bound cost/latency if a run is ever misconfigured to loop.
@@ -850,14 +1533,35 @@ class _HostedApiAdapter(Adapter):
     SUPPORTS_HEADLESS = True
     SUPPORTS_MODEL_SELECTION = True
 
+    # The environment variable this vendor's credential is read FROM. A name,
+    # never a value — deliberately not called `_API_KEY_*`: the constant holds
+    # public configuration, and a credential-shaped name on a non-credential is
+    # how both a reader and a static analyzer end up misreading this path.
     # Subclasses override.
-    _API_KEY_ENV: str = ""
+    _ENV_VAR_NAME: str = "OPENAI_API_KEY"
 
-    def _api_key_env(self) -> str:
-        return (getattr(self.spec, "api_key_env", None) or self._API_KEY_ENV) or "OPENAI_API_KEY"
+    def _env_var_name(self) -> str:
+        """Name of the environment variable holding this agent's credential.
+
+        Rebuilt through :func:`redaction.safe_env_var_name`, because this value
+        is *displayed* — it reaches ``jury --doctor``, its JSON export, and
+        warning text — while ``[[agent]] api_key_env`` is an arbitrary operator
+        string. The sanitizer both bounds it to a real env var name (so a config
+        value cannot splice a newline into a JSON document) and severs it from
+        the credential-shaped config field it came from. The credential VALUE
+        never travels this way; see :meth:`_api_key`.
+        """
+        return redaction.safe_env_var_name(
+            getattr(self.spec, "api_key_env", None), self._ENV_VAR_NAME
+        )
 
     def _api_key(self) -> str:
-        return os.environ.get(self._api_key_env(), "")
+        """The credential itself. NEVER rendered — only compared and sent.
+
+        Kept under a deliberately sensitive name so any future flow from here
+        into a log or an export is reported rather than blending in.
+        """
+        return os.environ.get(self._env_var_name(), "")
 
     def _api_url(self) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -878,7 +1582,7 @@ class _HostedApiAdapter(Adapter):
         """
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in self._api_key()):
             return (
-                f"{self._api_key_env()} contains a control character (e.g. a stray "
+                f"{self._env_var_name()} contains a control character (e.g. a stray "
                 f"trailing newline from how the secret was loaded) and cannot be "
                 f"used as an HTTP header value"
             )
@@ -922,7 +1626,7 @@ class _HostedApiAdapter(Adapter):
         invalid_reason = self._invalid_key_reason() if key_set else None
         has_key = key_set and invalid_reason is None
         if not key_set:
-            warnings = [f"{self._api_key_env()} is not set in the environment"]
+            warnings = [f"{self._env_var_name()} is not set in the environment"]
         elif invalid_reason:
             warnings = [invalid_reason]
         else:
@@ -946,8 +1650,17 @@ class _HostedApiAdapter(Adapter):
     def parse_content(data: dict) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
-    def run(self, prompt: str, phase: str = "review", timeout: int | None = None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        phase: str = "review",
+        timeout: int | None = None,
+        role_policy=None,
+    ) -> AgentResult:
         del phase
+        # A network adapter has no tools, no shell and no filesystem, so a
+        # write-enabled role changes nothing about how it is invoked (#661).
+        del role_policy
         # Checked independently of available() (not just "not available()"):
         # available() now also returns False for a key that IS set but
         # invalid, and that case needs its own distinct error_code/message
@@ -959,7 +1672,7 @@ class _HostedApiAdapter(Adapter):
                 False,
                 "",
                 0.0,
-                f"{self._api_key_env()} is not set in the environment",
+                f"{self._env_var_name()} is not set in the environment",
                 error_code=ERR_MISSING_API_KEY,
             )
         invalid_reason = self._invalid_key_reason()
@@ -1005,6 +1718,17 @@ class _HostedApiAdapter(Adapter):
                 "hosted API returned empty content",
                 error_code=ERR_EMPTY_OUTPUT,
             )
+        no_review = no_review_reason(content)
+        if no_review is not None:
+            return AgentResult(
+                self.name,
+                self.spec.vendor,
+                False,
+                "",
+                dur,
+                f"no review returned: {no_review}",
+                error_code=ERR_NO_REVIEW,
+            )
         return AgentResult(self.name, self.spec.vendor, True, content, dur)
 
 
@@ -1016,18 +1740,38 @@ class AnthropicApiAdapter(_HostedApiAdapter):
     CLI install or interactive login needed.
     """
 
-    _API_KEY_ENV = "ANTHROPIC_API_KEY"
+    _ENV_VAR_NAME = "ANTHROPIC_API_KEY"
 
     def _api_url(self) -> str:
         return _ANTHROPIC_API_URL
 
     def build_payload(self, prompt: str) -> dict:
-        """Build the Anthropic Messages API request body (pure)."""
-        return {
-            "model": self.spec.model or "",
+        """Build the Anthropic Messages API request body (pure).
+
+        With an effort level configured, extended thinking is enabled with the
+        mapped token budget. ``max_tokens`` must exceed that budget (thinking
+        tokens are drawn from the same allowance), so it is raised to leave the
+        original response allowance on top of it — bounded by
+        :data:`_ANTHROPIC_MAX_TOKENS_CEILING`, since per-model ``max_tokens``
+        caps vary and an unbounded sum would build a request some models reject.
+        """
+        payload = {
+            "model": self.resolved_model(),
             "max_tokens": _HOSTED_API_MAX_TOKENS,
             "messages": [{"role": "user", "content": prompt}],
         }
+        payload.update(self.effort_plan().payload)
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict):
+            # Clamped here too, not only in effort_args, so `budget < max_tokens
+            # <= ceiling` holds for any plan handed to this builder.
+            budget = min(
+                int(thinking["budget_tokens"]),
+                _ANTHROPIC_MAX_TOKENS_CEILING - _HOSTED_API_MAX_TOKENS,
+            )
+            payload["thinking"] = {**thinking, "budget_tokens": budget}
+            payload["max_tokens"] = budget + _HOSTED_API_MAX_TOKENS
+        return payload
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1060,17 +1804,19 @@ class OpenAiApiAdapter(_HostedApiAdapter):
     against the real hosted API with an ``Authorization`` header.
     """
 
-    _API_KEY_ENV = "OPENAI_API_KEY"
+    _ENV_VAR_NAME = "OPENAI_API_KEY"
 
     def _api_url(self) -> str:
         return _OPENAI_API_URL
 
     def build_payload(self, prompt: str) -> dict:
         """Build the OpenAI chat-completions request body (pure)."""
-        return {
-            "model": self.spec.model or "",
+        payload = {
+            "model": self.resolved_model(),
             "messages": [{"role": "user", "content": prompt}],
         }
+        payload.update(self.effort_plan().payload)
+        return payload
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1088,6 +1834,28 @@ class OpenAiApiAdapter(_HostedApiAdapter):
             return ""
         message = choices[0].get("message") or {}
         return (message.get("content") or "").strip()
+
+
+class XaiApiAdapter(OpenAiApiAdapter):
+    """Hosted xAI (Grok) API reviewer, keyed by ``XAI_API_KEY`` (issue #701).
+
+    Configure as a normal ``[[agent]]`` with ``vendor = "xai-api"`` and a
+    ``model`` (a Grok model id) — no ``command``, no CLI install. xAI serves
+    the OpenAI chat-completions shape at its own host, so this is
+    :class:`OpenAiApiAdapter` with a different URL and a different credential
+    env var; the request body, the response parsing and the effort knob
+    (``reasoning_effort``) are inherited rather than re-stated, because a
+    second copy of them is a second thing to keep in step.
+
+    ``vendor = "openai-compatible"`` with ``endpoint = "https://api.x.ai/v1"``
+    still works and is still documented; this spelling exists so a Grok seat
+    can carry the vendor identity ``xai-api`` instead of borrowing OpenAI's.
+    """
+
+    _ENV_VAR_NAME = "XAI_API_KEY"
+
+    def _api_url(self) -> str:
+        return _XAI_API_URL
 
 
 _GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -1118,7 +1886,7 @@ class GoogleApiAdapter(_HostedApiAdapter):
     not required for parity with the other two adapters.
     """
 
-    _API_KEY_ENV = "GEMINI_API_KEY"
+    _ENV_VAR_NAME = "GEMINI_API_KEY"
 
     def _api_url(self) -> str:
         # Escape the model id as a single path segment (issue #432 review): an
@@ -1127,12 +1895,14 @@ class GoogleApiAdapter(_HostedApiAdapter):
         # semantics instead of staying a single `{model}` segment.
         import urllib.parse
 
-        model = urllib.parse.quote(self.spec.model or "", safe="")
+        model = urllib.parse.quote(self.resolved_model(), safe="")
         return f"{_GEMINI_API_BASE}/{model}:generateContent"
 
     def build_payload(self, prompt: str) -> dict:
         """Build the Gemini ``generateContent`` request body (pure)."""
-        return {"contents": [{"parts": [{"text": prompt}]}]}
+        payload: dict = {"contents": [{"parts": [{"text": prompt}]}]}
+        payload.update(self.effort_plan().payload)
+        return payload
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1185,11 +1955,23 @@ class MockAdapter(Adapter):
             "warnings": [],
         }
 
-    def run(self, prompt: str, phase: str = "review", timeout: int | None = None) -> AgentResult:
-        del prompt, timeout
+    def run(
+        self,
+        prompt: str,
+        phase: str = "review",
+        timeout: int | None = None,
+        role_policy=None,
+    ) -> AgentResult:
+        del prompt, timeout, role_policy
         n = self.name
         if phase == "review":
             body = (
+                # The two lines the review prompt asks every reviewer to open
+                # with (#700). The mock speaks the shape a real reviewer is asked
+                # for, so `--mock` exercises the scope/testing lift rather than
+                # only the inference fallback behind it.
+                "Checked: src/example.py\n"
+                "Tested: nothing run (offline mock reviewer)\n"
                 f"- **[major]** `src/example.py:42` — {n}: unchecked return value "
                 f"may swallow an error.\n"
                 f"- **[minor]** `src/example.py:7` — {n}: missing docstring.\n\n"
@@ -1250,7 +2032,7 @@ class GenericOpenAICompatibleAdapter(_HostedApiAdapter):
     Supports custom ``endpoint``, custom ``api_key_env``, and extra HTTP ``headers``.
     """
 
-    _API_KEY_ENV = "OPENAI_API_KEY"
+    _ENV_VAR_NAME = "OPENAI_API_KEY"
 
     def _api_url(self) -> str:
         endpoint = (self.spec.endpoint or _OPENAI_API_URL).rstrip("/")
@@ -1259,10 +2041,12 @@ class GenericOpenAICompatibleAdapter(_HostedApiAdapter):
         return f"{endpoint}/chat/completions"
 
     def build_payload(self, prompt: str) -> dict:
-        return {
-            "model": self.spec.model or "",
+        payload = {
+            "model": self.resolved_model(),
             "messages": [{"role": "user", "content": prompt}],
         }
+        payload.update(self.effort_plan().payload)
+        return payload
 
     def _headers(self) -> dict[str, str]:
         hdrs = {
@@ -1311,6 +2095,33 @@ class GenericCLIAdapter(Adapter):
     - ``prompt_mode = "arg"``: prompt passed as positional argument on argv
     """
 
+    def _prompt_mode(self) -> str:
+        return (self.spec.prompt_mode or "stdin").lower()
+
+    def build_argv(self, prompt: str) -> list[str]:
+        """Read-only argv for a configured `cli` profile.
+
+        Implemented rather than inherited (the base raises) so this adapter goes
+        through the same ``build_argv_for_role`` seam as every other one — the
+        role policy is then decided in exactly one place for every vendor.
+        """
+        argv = [self.spec.command, *_read_only_extra_args(self.spec)]
+        return [*argv, prompt] if self._prompt_mode() == "arg" else argv
+
+    def build_write_argv(self, prompt: str) -> list[str]:
+        """Write-capable argv.
+
+        A `cli` profile has no vendor-specific sandbox flag to add or remove, so
+        this resolves to the same configured ``extra_args`` as the read-only
+        argv. It is still routed through :func:`_write_extra_args` so the rule
+        lives with every other vendor's rather than being special-cased here.
+        """
+        argv = [self.spec.command, *_write_extra_args(self.spec)]
+        return [*argv, prompt] if self._prompt_mode() == "arg" else argv
+
+    def _stdin_for(self, prompt: str) -> str | None:
+        return None if self._prompt_mode() == "arg" else prompt
+
     def available(self) -> bool:
         command = self.spec.command or ""
         if not command:
@@ -1336,7 +2147,13 @@ class GenericCLIAdapter(Adapter):
             "warnings": [],
         }
 
-    def run(self, prompt: str, phase: str = "review", timeout: int | None = None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        phase: str = "review",
+        timeout: int | None = None,
+        role_policy=None,
+    ) -> AgentResult:
         del phase
         if not self.available():
             return AgentResult(
@@ -1349,16 +2166,8 @@ class GenericCLIAdapter(Adapter):
                 error_code=ERR_MISSING_CLI,
             )
         effective_timeout = timeout if timeout is not None else self.spec.timeout
-        extra_args = _read_only_extra_args(self.spec)
-        argv = [self.spec.command, *extra_args]
-
-        mode = (self.spec.prompt_mode or "stdin").lower()
-        stdin_content = None
-
-        if mode == "arg":
-            argv.append(prompt)
-        else:
-            stdin_content = prompt
+        argv = self.build_argv_for_role(prompt, role_policy)
+        stdin_content = self._stdin_for(prompt)
 
         start = time.monotonic()
         try:
@@ -1401,6 +2210,7 @@ class GenericCLIAdapter(Adapter):
                 duration,
                 f"exit {res.returncode}: {safe_detail[:500]}",
                 error_code=err_code,
+                exit_code=res.returncode,
             )
 
         if not out:
@@ -1412,11 +2222,32 @@ class GenericCLIAdapter(Adapter):
                 duration,
                 "agent produced empty output",
                 error_code=ERR_EMPTY_OUTPUT,
+                exit_code=res.returncode,
             )
 
-        return AgentResult(self.spec.name, self.spec.vendor, True, out, duration)
+        no_review = no_review_reason(out)
+        if no_review is not None:
+            return AgentResult(
+                self.spec.name,
+                self.spec.vendor,
+                False,
+                "",
+                duration,
+                f"no review returned: {no_review}: {redaction.redact(out)[0][:200]}",
+                error_code=ERR_NO_REVIEW,
+                exit_code=res.returncode,
+            )
+
+        return AgentResult(
+            self.spec.name, self.spec.vendor, True, out, duration, exit_code=res.returncode
+        )
 
 
+#: The adapter registry: protocol name -> the class that builds its argv. Keyed
+#: by vendor name because a vendor's shipped adapter IS its default protocol —
+#: which is also why the vendor vocabulary doubles as the ``adapter`` vocabulary
+#: (``config.recognised_adapters``). A seat naming ``adapter`` picks a row here
+#: directly instead of inheriting its vendor's (issue #705).
 _VENDOR_ADAPTERS: dict[str, type[Adapter]] = {
     "anthropic": ClaudeAdapter,
     "openai": CodexAdapter,
@@ -1425,20 +2256,70 @@ _VENDOR_ADAPTERS: dict[str, type[Adapter]] = {
     "anthropic-api": AnthropicApiAdapter,
     "openai-api": OpenAiApiAdapter,
     "google-api": GoogleApiAdapter,
+    "xai-api": XaiApiAdapter,
     "openai-compatible": GenericOpenAICompatibleAdapter,
+    # `xai` is a bring-your-own-CLI seat (Grok through Cursor's `cursor-agent`,
+    # issue #701): the operator supplies `command`/`extra_args`, exactly as for
+    # `cli`, but the seat keeps its own vendor identity at the panel gate.
+    "xai": GenericCLIAdapter,
     "cli": GenericCLIAdapter,
 }
 
 
 def register_adapter(vendor: str, adapter_cls: type[Adapter]) -> None:
-    """Register a custom adapter class for a vendor string."""
-    _VENDOR_ADAPTERS[vendor.lower()] = adapter_cls
+    """Register a custom adapter class for a vendor string.
+
+    The name registered is usable as BOTH a ``vendor`` and an ``adapter``
+    (issue #705): the registry is the adapter vocabulary, so a custom adapter is
+    selectable by a seat that keeps some other vendor identity.
+
+    Registering also teaches ``config`` the name (issue #701): a vendor with an
+    adapter behind it is a vendor this run genuinely knows, so it must not warn
+    as unknown and must not be folded into the generic ``cli`` identity at the
+    cross-vendor gate. The two registries are updated together so they cannot
+    disagree about what "known" means.
+    """
+    name = config_module.normalise_vendor(vendor)
+    if not name:
+        # One guard, ahead of both tables. `register_vendor` ignores a name that is
+        # empty after normalisation, and this used to write the adapter under the
+        # key "" regardless — the two registries disagreeing for exactly the input
+        # they were joined to agree on.
+        raise ValueError("register_adapter: vendor name is empty after normalisation")
+    config_module.register_vendor(name)
+    _VENDOR_ADAPTERS[name] = adapter_cls
 
 
 def make_adapter(spec: AgentSpec, mock: bool = False) -> Adapter:
+    """The adapter that builds *spec*'s command line.
+
+    Selected by the seat's ADAPTER key, which is its ``vendor`` unless the
+    operator named one (issue #705). Keying this on the vendor made the two
+    inseparable: a GPT model reached through Cursor's ``cursor-agent`` got
+    ``codex exec`` argv it cannot parse, and the only way to a passthrough argv
+    was ``vendor = "cli"``, which cost the seat its identity at the panel gate.
+    Nothing else about the seat moves — the ballot, the report and
+    ``min_vendors`` all still read ``spec.vendor``.
+
+    Raises ``ConfigError`` when the seat NAMES an adapter this build does not
+    have (issue #708). The generic fall-through below still catches an unknown
+    *vendor* — that seat named no protocol, so inheriting the generic one is the
+    documented behaviour — but it must never catch a named one: falling through
+    there is the silent guess #705 exists to remove, and it made every reader
+    that loads a config without validating it (``--doctor``, ``jury run-agent``)
+    disagree with the run about the very same file.
+    """
+    # ``or None`` mirrors ``AgentSpec.__post_init__``: an adapter that
+    # normalises to nothing is no adapter at all, and falls back to the vendor.
+    # A raw dict-built or hand-made spec must read the same as a loaded one.
+    adapter_error = config_module.unknown_adapter_error(
+        getattr(spec, "adapter", None) or None, getattr(spec, "name", "") or ""
+    )
+    if adapter_error is not None:
+        raise config_module.ConfigError(adapter_error)
     if mock:
         return MockAdapter(spec)
-    cls = _VENDOR_ADAPTERS.get((spec.vendor or "").lower())
+    cls = _VENDOR_ADAPTERS.get(config_module.spec_adapter(spec))
     if cls is not None:
         return cls(spec)
     if spec.endpoint or (spec.api_key_env and not spec.command):

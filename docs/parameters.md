@@ -7,6 +7,20 @@ A complete reference of every `jury` parameter — CLI flags, subcommand flags, 
 left unset falls through to the config; a config key left unset falls through to
 the default shown below.
 
+**Bounds hold on both surfaces.** A value out of range is refused before the
+diff is read and before any agent runs — exit **2**, naming what you wrote and
+the rule it breaks — whether you wrote it as a flag or as a config key. The two
+messages state the same rule and differ only in the name they blame:
+
+```
+$ jury --pr 123 --rounds 0
+error: --rounds must be an integer >= 1 (got 0).
+
+$ jury --config-validate          # with rounds = 0 in jury.toml
+Config invalid (jury.toml): invalid configuration:
+  - jury.rounds must be an integer >= 1 (got 0).
+```
+
 ---
 
 ## Common recipes
@@ -57,6 +71,10 @@ jury --pr 123 --rounds 1
 jury --mock --diff-file examples/sample.diff
 #   → exercise the full pipeline locally; byte-identical output every run
 
+# Run ONE agent for one role and get a JSON result (orchestrator integration)
+jury run-agent --agent claude --role review --prompt-file gate.md
+#   → one agent, read-only, `ai-jury.run-agent.v1` JSON on stdout with attribution
+
 # CI gate — fail the build on blocking findings
 jury --pr 123 --ci --fail-on critical,major
 #   → exit non-zero if any confirmed critical/major finding remains
@@ -88,6 +106,7 @@ jury --pr 123 --suggest-patches --patches-out fixes.patch
 # Machine-readable output for tooling
 jury --pr 123 --format json -o review.json     # JSON document to a file
 jury --pr 123 --format sarif -o review.sarif   # SARIF for code-scanning upload
+jury --pr 123 --format keel-reviews -o rv.json # one review record per panelist
 
 # Phased posting — Round 1 / debate / decision as separate comments
 jury --pr 123 --post --post-mode phased
@@ -135,11 +154,12 @@ current branch from stdin.
 | `--max-rounds` | integer ≥ 1 | = `rounds` | Ceiling on adaptive rounds when early-stop is on. |
 | `--early-stop` / `--no-early-stop` | flag | from config (`false`) | Adaptive: stop after round 1 when reviewers agree; debate only on disagreement. |
 | `--auto` / `--no-auto` | flag | from config (`false`) | Risk-aware auto-depth: scale rounds/verify to the diff profile. |
-| `--tiered` | flag | from config (`routing = "standard"`) | Risk-aware tiered model routing: routes routine diffs to economical models while keeping frontier models as anchors for critical files. |
-| `--hints` / `--no-hints` | flag | from config (`hints = false`) | Static analysis pre-pass: runs fast local linters (Ruff, ESLint) and injects hints into Round 1 prompt context. |
+| `--tiered` | flag | from config (`routing = "standard"`) | Risk-aware tiered routing: on a `low`/`medium`-risk diff, round 1 seats the economical seats plus one frontier anchor and benches the other frontier seats; a `high`-risk diff seats everybody; a `critical`/`major` finding escalates the benched seats into the debate and a frontier chair. See [tiered routing](configuration.md#tiered-routing-routing--tiered--static-hints-hints--true). |
+| `--hints` / `--no-hints` | flag | from config (`hints = false`) | Static analysis pre-pass: runs fast local linters (Ruff, ESLint) on the files changed by the diff under review — never the whole tree — and injects what they flag into Round 1 prompt context. No block when the change touches no `.py`/`.js`/`.ts`. |
 | `--verify` / `--no-verify` | flag | from config (`true`) | Run (or skip) the verification round. |
 | `--chair` | agent name, or `rotate` | from config (`claude`) | Which agent synthesizes the verdict (and runs verification). Must be an enabled agent. |
 | `--seed` | integer | from config (unset) | Reproducible orchestration; identical mock runs + seed ⇒ byte-identical reports. |
+| `--effort` | `low` \| `medium` \| `high` | from config (unset) | Reasoning effort for every agent this run, mapped per vendor. |
 
 A fixed `--rounds N` is a hard override: it also disables adaptive early-stop
 (for reproducible fixed-N runs) unless you pass `--early-stop` explicitly.
@@ -149,24 +169,64 @@ A fixed `--rounds N` is a hard override: it also disables adaptive early-stop
 `jury --pr 123 --early-stop --max-rounds 3 --chair rotate` debates only on
 disagreement, up to 3 rounds, rotating the synthesizing chair per run.
 
+**`--effort {low,medium,high}`** sets the reasoning effort for **every** agent
+this run, overriding any `[[agent]] effort`. It is mapped to each vendor's own
+control (agy model suffix, Anthropic thinking budget, OpenAI `reasoning_effort`,
+Gemini `thinkingConfig`); a vendor with no effort control warns once on stderr
+(`effort unsupported for <vendor>, ignored`) and runs unchanged. See the
+[per-vendor mapping table](configuration.md#reasoning-effort-agent-effort----effort).
+
 ### Execution budget & reliability
 
 | Flag | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--total-timeout` | seconds | unset | Overall wall-clock budget for the whole run. |
-| `--phase-timeout` | seconds | unset | Per-phase wall-clock budget. |
+| `--total-timeout` | seconds ≥ 1 | unset | Overall wall-clock budget for the whole run. |
+| `--phase-timeout` | seconds ≥ 1 | unset | Per-phase wall-clock budget. |
 | `--retries` | integer ≥ 0 | `0` | Extra attempts for *transient* failures (timeout / rate-limit / spawn). |
 | `--strict` | flag | off | Fail the run if any configured agent CLI is missing. |
+| `--min-vendors` | integer ≥ 0 | from config (`2`) | Fail (**exit 3**) unless at least N **distinct vendors contributed a review**. `0` disables. |
+| `--no-min-vendors` | flag | off | Explicit opt-out: accept a panel that collapsed to one vendor (same as `--min-vendors 0`). |
+| `--min-reviews` | integer ≥ 0 | from config (`0`) | Require N **reviews** for a downstream consumer — one per agent that answers. The chair's synthesis record is carried beside them and is not one. Checked before the panel runs (exit **2**, nothing is spent) and again on the result (exit **3**). `0` disables. See [`docs/configuration.md`](configuration.md#the-panel-size-guard-min_reviews). |
 
 **Example:** `jury --pr 123 --total-timeout 900 --phase-timeout 240 --retries 1`
 caps the whole run at 15 min, each phase at 4 min, and retries transient
 failures once.
 
+#### The cross-vendor guard (`--min-vendors`)
+
+`--strict` checks **availability at startup**; `--min-vendors` checks
+**participation at the end**. They catch different failures: an agent can be on
+`PATH`, exit 0 on its version probe, be reported `[available]` by `jury
+--doctor`, and still contribute nothing to the panel — which is how a
+three-vendor jury silently becomes a single-vendor rubber stamp.
+
+It counts *vendors*, not slots: three agents from one vendor are one
+perspective, and an abstention (a reply with no findings block) is not one at
+all. Exit **3** is deliberately distinct from the `--ci` findings failure (exit
+1), so a caller can tell "the reviewers disagreed with you" from "the reviewers
+never ran", and a collapsed panel outranks the severity gate when both apply.
+
+It fails **closed** by default: the threshold is `2`, from `[jury.ci]
+min_vendors`. It scopes on the vendors your config **names**, so from this
+release a config naming two or more distinct vendors exits 3 unless at least
+that many actually contributed — **including when a configured CLI is not
+installed**. The shipped three-vendor `jury.toml` on a machine with one CLI
+fails; that is a collapsed panel, not an exemption. Only a config that never
+claimed the consensus — fewer distinct vendors enabled than the threshold, e.g.
+a deliberate single-agent setup — keeps exiting 0. A threshold you type is
+enforced as typed: `--min-vendors 2` on a one-vendor config fails, because you
+asked for it.
+
+Two escapes: `--no-min-vendors` (or `min_vendors = 0` under `[jury.ci]`) accepts
+a collapsed panel, and `--strict` catches a **missing CLI at startup** instead —
+the same situation, reported before the run rather than after it. The failure
+message names both.
+
 ### Large-diff handling
 
 | Flag | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--max-diff-bytes` | integer | `200000` | Size budget for the filtered diff before chunk/too-large. |
+| `--max-diff-bytes` | integer ≥ 1 | `200000` | Size budget for the filtered diff before chunk/too-large. |
 | `--chunk` / `--no-chunk` | flag | from config (`false`) | Chunk an over-budget diff by file instead of failing. |
 | `--exclude` | path glob (repeatable) | from config (`[]`) | Exclude files matching this glob. |
 | `--include` | path glob (repeatable) | from config (`[]`) | Only review files matching this glob. |
@@ -195,20 +255,34 @@ sends the PR description/context alongside the diff and applies a repo policy.
 
 | Flag | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--format` | `markdown` \| `json` \| `sarif` | `markdown` | Output format for stdout/`--output`. |
+| `--format` | `markdown` \| `json` \| `sarif` \| `keel-reviews` | `markdown` | Output format for stdout/`--output`. `keel-reviews` emits a JSON array of per-panelist review records (plus the chair) for a consumer that renders one head-pinned verdict per reviewer — see [report-format.md](report-format.md#the-keel-reviews-bundle). |
 | `--decision` | `chair` \| `vote` | from config (`chair`) | Final verdict source. `chair` = the chair's synthesis is the verdict (default). `vote` = a **panel vote**: each reviewer votes from the worst finding they raised, majority wins, ties resolve to the stricter stance; the chair's synthesis is then shown as supporting reasoning. The vocabulary is mode-aware — a diff/PR votes **REQUEST CHANGES > COMMENT > APPROVE**; an `--issue` votes **NEEDS-INFO > UNCLEAR > READY**. Rendering-only — does not change the run, the cache key, or the severity-based `--ci` gate. Example: `jury --pr 123 --decision vote`. |
 | `--transcript` / `--no-transcript` | flag | from config | Render the full play-by-play transcript (each agent's review, the debate, and the chair's reasoning) instead of the consensus-first summary. `--no-transcript` forces the summary even if `[jury] transcript` is set. Markdown only; rendering-only (does not change the run or its cache key). |
 | `--verbose` | flag | off | Summary report **and** the full transcript, in one document. Implies a transcript even with `--no-transcript`. |
 | `--live` | flag | off | Stream each step (each review, each debate turn, verification, the decision) to stdout **as it happens**. Add **`--post`** (with `--pr` or `--issue`) to also post each step as its own comment on the PR/issue (posting is opt-in — a bare target only selects the source). The live stream replaces the consolidated **markdown** stdout dump (`-o` still writes the full report to a file; `--format json`/`sarif` still print the document to stdout). In chunked large-diff mode the stream repeats once per chunk. |
-| `-o`, `--output` | path | stdout | Write the report to a file. |
+| `-o`, `--output` | path | stdout | Write the report to a file. If the path cannot be written the report is printed to **stdout** instead and `jury` exits **2** — see below. |
 | `--metadata-json` | path | — | Write machine-readable run metadata (durations, status, rounds) as JSON. |
 | `-q`, `--quiet` | flag | off | Suppress progress logs on stderr. |
+
+**An unwritable `--output` never costs you the run.** The report is written at
+the very end, when the panel has already been invoked and paid for, so a missing
+parent directory, a permission failure or a full disk must not be the end of it.
+`jury` names the path and the reason on stderr, prints the report to stdout —
+where it would have gone had `-o` not been passed — and exits **2**:
+
+```
+$ jury --pr 123 -o /nonexistent/report.md > report.md
+error: could not write the report to '/nonexistent/report.md': [Errno 2] No such file or directory: '/nonexistent/report.md'
+error: the review is complete and is printed on stdout instead; redirect it to keep the report.
+```
+
+Nothing is written to any path you did not name.
 
 `--transcript` / `--verbose` shape the **stdout / `--output` / single-comment**
 report. Phased posting (`--post-mode phased`) always posts the per-round
 sections regardless, since it is already a round-by-round layout.
 
-`--format` accepts `markdown` | `json` | `sarif`. `--transcript` and `--verbose`
+`--format` accepts `markdown` | `json` | `sarif` | `keel-reviews`. `--transcript` and `--verbose`
 apply to **markdown only**; `--live` streams markdown steps to stdout (and, with
 `--pr --post`, posts each step). `--no-transcript` forces the summary even when
 `[jury] transcript = true`.
@@ -248,8 +322,11 @@ calling GitHub.
 | `--fail-on` | comma-separated severities | from config (`critical,major`) | Severities that fail CI. See [severities](#severities). |
 
 `--fail-on` takes a comma-separated list drawn from the [severities](#severities)
-(`critical`, `major`, `minor`, `nit`, `info`; `blocker` aliases `critical`).
-Without `--ci`, `--fail-on` has no effect on the exit code.
+(`critical`, `major`, `minor`, `nit`, `info`; `blocker` aliases `critical`),
+matched case-insensitively. A value outside that vocabulary exits **2** naming
+it — even without `--ci`, and before any agent runs — rather than gating on a
+severity no finding can carry. Without `--ci`, `--fail-on` has no effect on the
+exit code.
 
 **Example:** `jury --pr 123 --ci --fail-on critical,major` exits non-zero when a
 confirmed critical or major finding remains — the canonical CI gate.
@@ -263,7 +340,14 @@ confirmed critical or major finding remains — the canonical CI gate.
 | `--clear-cache` | flag | — | Delete all cache entries and exit (alias: `jury cache clear`). |
 
 The cache key covers the diff, effective config, prompt version, package
-version, context policy, and seed — change any and the next run is a miss.
+version, context policy, and seed — change any and the next run is a miss. Under
+`--context-mode expanded` it also covers the context **text** the panel is shown,
+so editing a PR title/body is a miss (#738); under the default `diff-only` the
+context reaches no reviewer and is not part of the key. Under `--hints` it also
+covers the **static-analysis block** the linters produced, under every context
+mode, so fixing a lint error in the working tree is a miss even when the diff and
+the config have not moved (#745); a run that produced no block — every run under
+the default `hints = false` included — keys exactly as it did before.
 
 **Example:** `jury --pr 123 --cache` reuses a stored verdict for an unchanged
 diff+config; `jury --clear-cache` (or `jury cache clear`) wipes all entries.
@@ -293,16 +377,30 @@ reviews only the new range since the last posted run, then posts.
 | `--strict-config` | flag | Treat configuration warnings as errors. |
 | `--mock` | flag | Offline demo using deterministic mock agents. |
 | `--doctor` | flag | Print a local readiness diagnostics report and exit (no telemetry). |
-| `--write` | path | With `--doctor`, also write diagnostics as JSON (secrets redacted). |
+| `--json` | flag | With `--doctor`, print the machine-readable provider export (schema `ai-jury.doctor.v1`) as the **only** thing on stdout. |
+| `--write` | path | With `--doctor`, also write the full internal diagnostics as JSON (secrets redacted). |
 | `--version` | flag | Print the version and exit. |
 | `-h`, `--help` | flag | Show help and exit. |
 
-**Depends on / conflicts:** `--write` only applies with `--doctor`.
+**Depends on / conflicts:** `--write` and `--json` only apply with `--doctor`;
+`--json` without `--doctor` exits `2` (use `--format json` for the review report).
 `--config-validate` and `--doctor` short-circuit the run (they print and exit).
+Under `--json` the `--write` confirmation line goes to stderr, so stdout stays a
+single JSON document.
 
 **Example:** `jury --config-validate --config jury.toml` validates and exits
 (`0` valid, `2` invalid); `jury --doctor --write doctor.json` prints readiness
-diagnostics and also writes them as redacted JSON.
+diagnostics and also writes them as redacted JSON;
+`jury --doctor --json | jq '.agents[] | select(.available) | .name'` lists the
+reviewers this machine can actually run. The exported schema is documented in
+[configuration.md](configuration.md#machine-readable-diagnostics-jury---doctor---json).
+
+**Doctor reports reachability, not contribution.** The `panel` block's
+`contributing_vendors` is **always `null`** — doctor runs no review, so it
+cannot know how many vendors would actually contribute one, and it says so
+rather than guessing. Only a real run measures that; the number lives in
+`panel.vendors` of a run's `--metadata-json`, and `--min-vendors` is what
+enforces it. A green doctor is not evidence of a cross-vendor panel.
 
 ---
 
@@ -321,7 +419,7 @@ diagnostics and also writes them as redacted JSON.
 | `--local-endpoint` | URL | OpenAI-compatible base URL for a local agent. |
 | `-o`, `--output` | path | Output path (default `jury.toml`). |
 | `--force` | flag | Overwrite an existing file. |
-| `--interactive` | flag | Force interactive prompts. |
+| `--interactive` | flag | Force interactive prompts. The interactive flow also asks for a reasoning [effort](configuration.md#reasoning-effort-agent-effort----effort) (skippable); a chosen level is written onto each agent whose vendor supports it, and every other effort-capable agent gets a commented `# effort = "medium"` hint. |
 | `--wizard` | flag | Guided, numbered-option setup for the most-used settings (reviewers, depth, decision, verification, context, CI gate). Every question is skippable (Enter keeps the built-in default); only the keys you choose are written, so the file stays minimal. |
 | `--list-agents` | flag | List known agents + availability and exit. |
 | `--list-models` | flag | List local models on the server and exit. |
@@ -329,6 +427,70 @@ diagnostics and also writes them as redacted JSON.
 **Example:** `jury init --preset balanced -o jury.toml` scaffolds a debate +
 early-stop config; `jury init --agents claude,codex,qwen --chair rotate
 --local-model qwen2.5-coder:7b` scaffolds a specific panel with a local model.
+
+### `jury run-agent` — run one agent for one role
+
+Dispatch a single agent instead of the whole panel, and get a JSON result with
+attribution. The integration point for an orchestrator (keel's `keel delegate
+run`) or a CI script. See the [cookbook recipe](cookbook.md#21-run-one-agent-for-an-orchestrator-keel).
+
+| Flag | Value | Description |
+| --- | --- | --- |
+| `--agent` | name \| `vendor[:model]` | A `[[agent]]` name from `jury.toml`, or a built-in vendor (`claude`, `codex`, `agy`, `anthropic-api`, `openai-api`, `google-api`, `xai-api`). A configured entry wins over a built-in of the same name. `:model` overrides the model. |
+| `--role` | `implement` \| `review` \| `gate` \| `chair` \| `fix` | What the agent is asked to do. Decides privilege — see below. |
+| `--prompt-file` | path \| `-` | The prompt to send (`-` reads stdin; not allowed with `--detach`). |
+| `--cwd` | directory | Run the agent in this directory (default: the current one). |
+| `--timeout` | seconds | Wall-clock bound on the **agent** (default: the agent's configured timeout). It never bounds a `--wait` — that is `--wait-timeout`. |
+| `--effort` | `low` \| `medium` \| `high` | Reasoning [effort](#reasoning-effort---effort--agent-effort) for vendors that support one; warns and is ignored otherwise. |
+| `--allow-write` | flag | Grant the vendor's write/tool mode. **Required** by `implement`/`fix`; warned about and ignored by the read-only roles. |
+| `--format` | `json` \| `text` | `json` (default) prints the full result document; `text` prints only the agent's text. |
+| `--detach` | flag | Start in the background and print the run id immediately. |
+| `--run-id` | id | Id for a detached run: letters, digits, `.`, `_`, `-`, max 64 characters, starting with a letter or digit (default: random). Anything else is refused — the id becomes a filename. Only valid with `--detach`. |
+| `--wait` | run id | Block until a detached run finishes, then print its document. A run that was never started is reported immediately. |
+| `--wait-timeout` | seconds | How long `--wait` blocks before giving up (default: the run's own timeout + 60 s, else 3600 s). |
+| `--status` | flag | List every recorded detached run as JSON and exit. A run still marked `running` whose process is gone is reported as `lost`. |
+| `--config` | path | Path to `jury.toml`. |
+| `--cache-dir` | path | Where detached-run state lives (default: `$JURY_CACHE_DIR` or `~/.cache/ai-jury`). |
+| `--mock` | flag | Run the offline mock adapter instead of a real agent. |
+
+**Role → privilege.** `review`, `gate` and `chair` always run under the vendor's
+read-only invocation — the same one a panel review uses — and `--allow-write`
+cannot change that (it warns and is ignored). `implement` and `fix` are
+write-capable only with `--allow-write`; without it the command exits 2.
+
+**Run states.** `running` (the child is alive, or we cannot tell), `done`
+(terminal — read `ok` and `error_code`), `lost` (still marked running, but the
+recorded process is definitively gone: killed, or crashed hard enough to skip
+its own cleanup). Both `--status` and `--wait` apply the same rule, so they
+cannot disagree; `--wait` returns as soon as it sees a lost run rather than
+blocking to its deadline. Liveness is probed on POSIX only; on Windows a run
+stays `running`, because `os.kill(pid, 0)` there terminates the process rather
+than probing it. A pid is not proof of identity — see the
+[cookbook](cookbook.md#long-runs-dispatch-now-collect-later) on why `running`
+is not authoritative across a reboot or a shared `--cache-dir`.
+
+**Attribution labels are family + major, deliberately coarse.** The rule is
+identical to [keel](https://github.com/berkayturanci/keel)'s `agents.model_base`
+because both projects write the same `model:<base>` label onto the same issues;
+a "better" rule on one side alone would split one project's history in half. So
+a tier or effort suffix **collapses** — `gemini-3.8-flash`,
+`gemini-3.8-flash-high` and `gemini-3.8-pro` all become `model:gemini-3` — while
+a vendor that spells its version with hyphens **keeps** it: `claude-opus-4-5`
+and `claude-opus-4-6` stay distinct. The label answers "roughly which family
+ran this", not "exactly which model"; the `model` field carries the exact id
+verbatim when that is what you need.
+
+**Result document** — `schema_version: "ai-jury.run-agent.v1"`, then `ok`,
+`agent`, `vendor`, `model`, `role`, `transport` (`cli`/`api`/`local`), `text`,
+`exit_code`, `duration_s`, `timed_out`, `error_code`, `error`, and
+`attribution` (`vendor`, `model`, and a `label` of `agent:<vendor>` plus a
+versionless `model:<base>`). `model` — and the `model` inside `attribution`,
+which is the same string — is the id the invocation **sent**, which is not
+always the configured one: an `effort` level encoded as a model-id suffix, or
+an adapter that fell back after checking the vendor's live listing, changes it.
+The configured id is reported only when the run recorded no id at all. Exit
+codes: `0` ran and produced output, `1` ran and failed, `2` the request was
+refused.
 
 ### Other subcommands
 
@@ -340,6 +502,7 @@ early-stop config; `jury init --agents claude,codex,qwen --chair rotate
 | `jury comment --text "/jury review" --pr N` | Run from an allowlisted PR comment. Actions: `review`, `summary` (see [comment actions](#comment-actions)). Flags: `--print-args`, `--no-post`. |
 | `jury examples` | Print a plain-language list of common example commands. |
 | `jury guide` | Print a short end-to-end walkthrough (install → init → review → post → CI). |
+| `jury run-agent --status` / `--wait <id>` | List or block on detached single-agent runs (see above). |
 
 Running bare `jury` with no arguments **in a terminal** prints a compact overview
 (what it does + the handful of commands most people use) and exits 0. In a
@@ -363,18 +526,18 @@ fails loudly.
 | `seed` | int | unset | Reproducible orchestration. |
 | `anonymize_debate` | bool | `true` | Strip agent identity in round 2 (relabel Reviewer A/B/…) to curb bias. |
 | `prefer_non_reviewer_chair` | bool | `false` | Prefer a chair that wasn't a round-1 reviewer (no effect when `chair = "rotate"`). |
-| `total_timeout` | int | unset | Overall wall-clock budget (seconds). |
-| `phase_timeout` | int | unset | Per-phase wall-clock budget (seconds). |
-| `retries` | int | `0` | Extra attempts for transient failures. |
-| `max_rounds` | int | = `rounds` | Round ceiling when `early_stop` is on. |
+| `total_timeout` | int | unset | Positive seconds when set; overall wall-clock budget. |
+| `phase_timeout` | int | unset | Positive seconds when set; per-phase wall-clock budget. |
+| `retries` | int | `0` | ≥ 0. Extra attempts for transient failures. |
+| `max_rounds` | int | = `rounds` | ≥ 1 when set. Round ceiling when `early_stop` is on. |
 | `early_stop` | bool | `false` | Adaptive rounds. |
 | `auto_depth` | bool | `false` | Risk-aware auto-depth (CLI `--auto`). |
 | `transcript` | bool | `false` | Default the markdown report to the full play-by-play transcript (CLI `--transcript` / `--no-transcript`). Rendering-only — not part of the config hash or cache key. |
 | `decision` | `"chair"` \| `"vote"` | `"chair"` | Final-verdict source: chair synthesis or a panel vote (CLI `--decision`). Rendering-only — not part of the config hash or cache key. |
 | `theater` | bool | `false` | Enable live interactive terminal animation. |
 | `theater_style` | `"flat"` \| `"pixel"` | `"flat"` | Visual aesthetic for terminal animation. |
-| `routing` | `"standard"` \| `"tiered"` | `"standard"` | Risk-aware tiered model routing with frontier anchor (CLI `--tiered`). |
-| `hints` | bool | `false` | Run fast static linter pre-pass to inject hints into Round 1 (CLI `--hints`). |
+| `routing` | `"standard"` \| `"tiered"` | `"standard"` | Risk-aware tiered routing with a frontier anchor (CLI `--tiered`): the round-1 panel follows the diff's risk band and each seat's `tier`; see [tiered routing](configuration.md#tiered-routing-routing--tiered--static-hints-hints--true). An unknown value is a hard config error, like `[[agent]] tier`: nothing but `"tiered"` selects the routed panel, so a typo would quietly buy the standard one. Part of the config hash and cache key. |
+| `hints` | bool | `false` | Run a fast static linter pre-pass over the *changed* files to inject hints into Round 1, under every context mode (CLI `--hints` / `--no-hints`). The flag is part of the config hash, and the **block the linters produced** is part of the cache key whenever there is one — it is a function of the working tree, so it can change while the diff and the config stand still. A run with no block keys as it did before the key existed. |
 | `demote_local_only` | bool | `false` | Demote uncorroborated single-local-model findings to minor advisory status. |
 
 **Example:**
@@ -409,9 +572,9 @@ transcript = true   # default the markdown report to the full play-by-play
 
 | Key | Type | Default | Allowed / notes |
 | --- | --- | --- | --- |
-| `max_bytes` | int | `200000` | Byte budget (after filtering) before chunk/too-large. |
+| `max_bytes` | int | `200000` | Positive when set. Byte budget (after filtering) before chunk/too-large. |
 | `chunk` | bool | `false` | Chunk an over-budget diff by file instead of failing. |
-| `chunk_max_bytes` | int | = `max_bytes` | Per-chunk byte budget when chunking. |
+| `chunk_max_bytes` | int | = `max_bytes` | Positive when set. Per-chunk byte budget when chunking. |
 | `exclude_generated` | bool | `true` | Drop binary + common generated/vendored files. |
 | `exclude` | list[str] | `[]` | Path-glob deny list (e.g. `["docs/**", "*.lock"]`). |
 | `include` | list[str] | `[]` | Path-glob allow list; when set, only matching files are reviewed. |
@@ -421,13 +584,16 @@ transcript = true   # default the markdown report to the full play-by-play
 | Key | Type | Default | Allowed / notes |
 | --- | --- | --- | --- |
 | `name` | string | — | **Required**, unique, non-empty. |
-| `vendor` | string | — | `anthropic` \| `openai` \| `google` \| `local` \| `anthropic-api` \| `openai-api` \| `google-api` \| `openai-compatible` \| `cli` \| custom registered vendor. |
-| `command` | string | — | CLI command (not required for HTTP/API vendors or when `endpoint` is set). |
+| `vendor` | string | — | `anthropic` \| `openai` \| `google` \| `xai` \| `local` \| `anthropic-api` \| `openai-api` \| `google-api` \| `xai-api` \| `openai-compatible` \| `cli` \| custom registered vendor. An unrecognised value warns and runs on the generic `cli` fallback, where it is counted as vendor `cli` by `min_vendors`. |
+| `adapter` | string | the vendor's own adapter | The **protocol** used to build this seat's command line, from the same vocabulary as `vendor` (`anthropic` \| `openai` \| `google` \| `xai` \| `local` \| `anthropic-api` \| `openai-api` \| `google-api` \| `xai-api` \| `openai-compatible` \| `cli` \| custom registered name). Unset means the vendor's shipped adapter, so an existing config is unchanged. Set it when a vendor's model is reached through some *other* CLI — `vendor = "openai", adapter = "cli", command = "cursor-agent"` runs Cursor's CLI and still counts as the vendor `openai`. A pair the tool finds surprising is accepted; an adapter name it does not have is a **hard config error**. See [identity vs. protocol](configuration.md#identity-vs-protocol-the-adapter-key). |
+| `command` | string | — | CLI command (not required for HTTP/API vendors or when `endpoint` is set; required whenever the *adapter* spawns a CLI). |
 | `model` | string | unset | Model identifier. Required for API providers and local models. |
 | `endpoint` | string | `http://localhost:11434/v1` (local) | Base URL for OpenAI-compatible HTTP providers (Ollama, OpenRouter, DeepSeek, Groq, Mistral, LiteLLM). |
-| `api_key_env` | string | unset (`OPENAI_API_KEY` default) | Environment variable name holding the API key for `openai-compatible` vendors (e.g. `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`). |
-| `prompt_mode` | string | `stdin` | Prompt delivery for `vendor = "cli"` (`stdin` \| `arg`). |
-| `headers` | table | `{}` | Custom HTTP headers map for `openai-compatible` API calls. |
+| `api_key_env` | string | unset (`OPENAI_API_KEY` default) | Environment variable **name** holding the API key for `openai-compatible` vendors (e.g. `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`). Must match `[A-Za-z_][A-Za-z0-9_]*` (max 128 chars); anything else warns and falls back to the vendor default, because this name is echoed into `jury --doctor` and its JSON export. The warning names the agent and the rule but never quotes the rejected value back. The key's **value** is read from the environment and never displayed. |
+| `prompt_mode` | string | `stdin` | Prompt delivery for `vendor = "cli"` (`stdin` \| `arg`). Part of the config hash when written, so two seats differing only in it do not share a cache entry — the prompt reaching a seat down a pipe or on argv is two invocation protocols, not one. A config that never names the key hashes exactly as it did before, so no existing cache entry is invalidated. |
+| `headers` | table of strings | `{}` | Custom HTTP headers map for `openai-compatible` API calls. A `headers` that is not a table (a bare string, an array) is a **hard** config error naming the agent, because it cannot become headers at all — as is a non-string header name. A non-string **value** (`X-Retries = 3`) **warns** and is coerced to a string before being sent, like a malformed `api_key_env` that falls back; `--strict-config` makes that fatal. Part of the config hash, so two seats differing only in a routing header do not share a cache entry. No message quotes the offending value back — a header is where a bearer token lives. |
+| `effort` | string | unset | `low` \| `medium` \| `high`. Reasoning effort, mapped per vendor (see [effort](configuration.md#reasoning-effort-agent-effort----effort)). An unknown value is a hard config error; a vendor with no effort control warns once and ignores it. Overridden by `--effort`. |
+| `tier` | string | `frontier` | `frontier` \| `economical`. The seat's cost tier, read by `routing = "tiered"` (see [tiered routing](configuration.md#tiered-routing-routing--tiered--static-hints-hints--true)): economical seats sit on routine diffs, frontier seats anchor them and are benched otherwise. The operator says which is which — there are no model-name heuristics. An unknown value is a hard config error. Part of the config hash only when set to `economical`, so an existing config's cache entries are unchanged. |
 | `timeout` | int | `600` | Positive seconds (inherits `jury.timeout`). |
 | `enabled` | bool | `true` | Disabled agents are skipped. |
 | `extra_args` | list[str] | `[]` | Extra CLI args (e.g. the secure-default sandbox flags). |
@@ -438,7 +604,9 @@ transcript = true   # default the markdown report to the full play-by-play
 
 ### Severities
 Ordered most → least severe: **`critical`**, **`major`**, **`minor`**, **`nit`**, **`info`**.
-Alias: `blocker` → `critical`. Used by `--fail-on` / `[jury.ci] fail_on`.
+Alias: `blocker` → `critical`. Used by `--fail-on` / `[jury.ci] fail_on`, both of
+which **refuse** anything outside this list: a misspelled severity would match no
+finding and pass the gate green forever.
 
 ### Verdicts
 The final verdict vocabulary is **mode-aware** (the rubric differs for code vs. an issue):
@@ -455,8 +623,14 @@ ties resolve to the **stricter** stance.
 `chair` (default — the chair synthesizes the verdict) · `vote` (panel vote; the chair's synthesis becomes supporting reasoning). Rendering-only — not part of the config hash, cache key, or the `--ci` gate.
 
 ### Vendors
-`anthropic` · `openai` · `google` · `local` (OpenAI-compatible: Ollama, llama.cpp, vLLM,
-LM Studio) · `anthropic-api` · `openai-api` · `google-api` · `openai-compatible` (OpenRouter, DeepSeek, Groq, Mistral, LiteLLM) · `cli` (arbitrary CLI agents: Aider, Goose, OpenHands) · custom registered vendors via `register_adapter()`.
+`anthropic` · `openai` · `google` · `xai` (Grok through a CLI such as Cursor's
+`cursor-agent`) · `local` (OpenAI-compatible: Ollama, llama.cpp, vLLM,
+LM Studio) · `anthropic-api` · `openai-api` · `google-api` · `xai-api` · `openai-compatible` (OpenRouter, DeepSeek, Groq, Mistral, LiteLLM) · `cli` (arbitrary CLI agents: Aider, Goose, OpenHands) · custom registered vendors via `register_adapter()`.
+
+Any other value is a warning, not an error: the seat runs on the generic `cli`
+fallback and is **counted as the vendor `cli`** by the cross-vendor guard, so two
+fallback seats cannot satisfy `min_vendors = 2` between them. The seat's
+configured string is still what the report and the ballots carry.
 
 ### Presets
 Set with `jury init --preset`.
@@ -468,8 +642,24 @@ Set with `jury init --preset`.
 | `balanced` | Debate + early-stop. |
 | `thorough` | All available agents + debate + verify. |
 
+### Reasoning effort (`--effort` / `[[agent]] effort`)
+`low` · `medium` · `high`. Supported by `google` (agy), `anthropic-api`,
+`openai-api`, `xai-api`, `openai-compatible` and `google-api`; ignored with a one-line
+warning for `anthropic`/`openai` (the `claude`/`codex` CLIs), `local`, `cli` and
+custom vendors.
+
 ### Output formats
-`markdown` (default) · `json` · `sarif`.
+`markdown` (default) · `json` · `sarif` · `keel-reviews` — the four `--format`
+values, as declared in `src/ai_jury/cli.py`
+(`choices=["markdown", "json", "sarif", "keel-reviews"]`).
+
+`keel-reviews` is a bundle rather than a report: a JSON array carrying one review
+record per seat that ran — a seat that returned nothing is present as an
+abstention naming it, flagged `counts_as_review: false` — plus the chair, for an
+orchestrator that shows a verdict per reviewer instead of one consolidated
+document. See
+[Output & format](#output--format) above and
+[report-format.md](report-format.md#the-keel-reviews-bundle).
 
 ### Context modes
 `diff-only` (default) · `expanded`.
@@ -492,6 +682,7 @@ Used by `jury comment`: `review` (full review) · `summary` (fast single-round p
 | `ANTHROPIC_API_KEY` | API key used by `vendor = "anthropic-api"`. |
 | `OPENAI_API_KEY` | API key used by `vendor = "openai-api"` and default for `openai-compatible`. |
 | `GEMINI_API_KEY` | API key used by `vendor = "google-api"`. |
+| `XAI_API_KEY` | API key used by `vendor = "xai-api"`. |
 | `OPENROUTER_API_KEY` | Default API key for `openrouter` template. |
 | `DEEPSEEK_API_KEY` | Default API key for `deepseek` template. |
 | `GROQ_API_KEY` | Default API key for `groq` template. |
