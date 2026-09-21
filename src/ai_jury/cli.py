@@ -20,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, panel
+from . import __version__, configtrust, panel
 from . import doctor as doctor_module
 from .adapters import EFFORT_LEVELS, effort_warnings, make_adapter
 from .ci import evaluate_ci, fail_on_error
@@ -1167,6 +1167,9 @@ def _run_init(rest: list[str]) -> int:
         return 2
 
     out_path.write_text(render_toml(config), encoding="utf-8")
+    # This config is the operator's own deliberate act, so record it as trusted: the
+    # ordinary `jury init` → `jury` path then never has to ask (#831).
+    configtrust.record_trust(out_path, configtrust.content_digest(out_path.read_bytes()))
     chosen = ", ".join(a["name"] for a in config["agent"])
     print(f"Wrote {out_path} — panel: {chosen} · rounds: {config['jury']['rounds']}")
     print(f"Next: jury --config-validate --config {out_path}")
@@ -1522,6 +1525,15 @@ def _run_run_agent(rest: list[str], spawn=None, sleep=None, clock=None) -> int:
         config = load_config(ns.config)
     except (ConfigError, FileNotFoundError) as exc:
         print(redact(f"error: {exc}")[0], file=sys.stderr)
+        return 2
+
+    # run-agent runs a config-defined command too, and a discovered config can even shadow
+    # a built-in name (`--agent claude` with `command = "sh"`), so it needs the same trust
+    # gate as a review (#831).
+    try:
+        configtrust.enforce(ns.config, config, mock=ns.mock)
+    except configtrust.ConfigTrustError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     spec, error = runagent.resolve_agent(config, ns.agent)
@@ -1988,7 +2000,7 @@ Setup
   jury init --wizard                 guided setup (writes jury.toml)
   jury init --preset thorough        non-interactive preset
   jury config show                   print the effective, resolved config
-  jury doctor                        check which agents/CLIs are available
+  jury --doctor                      check which agents/CLIs are available
 
 Review
   jury --pr 123                      review a pull request
@@ -2014,7 +2026,7 @@ ai-jury — a short walkthrough
 1. Install the agent CLIs you have (any subset works): Claude Code, Codex,
    Antigravity. Optionally run a local model via Ollama for a free panelist.
    Check what's available:
-       jury doctor
+       jury --doctor
 
 2. Create a config (picks reviewers, rounds, chair/vote, verify):
        jury init --wizard
@@ -2188,6 +2200,13 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config, validate=True, strict=args.strict_config)
     except ConfigError as exc:
         print(f"Config invalid: {redact(str(exc))[0]}", file=sys.stderr)
+        return 2
+    # An auto-discovered ./jury.toml that runs local commands must be trusted before those
+    # commands run — the checkout may be one this operator did not write (#831).
+    try:
+        configtrust.enforce(args.config, config, mock=args.mock)
+    except configtrust.ConfigTrustError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     # One value, one field, one answer, whichever surface it was written on
     # (issue #748). The overrides below are assigned straight onto the config
