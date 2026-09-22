@@ -27,15 +27,51 @@ fail() {
     exit 1
 }
 
+# The physical directory a path names, so two spellings of one directory compare equal.
+real_dir() {
+    (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# pipx, uv and Homebrew all install `jury` as a symlink into their own environment,
+# and this script's venv fallback links it too. A regular file there, after a tool
+# reported success, is one the tool did not write: an older install — the previous
+# installer's `pip install --user` put one exactly there — that pipx refuses to
+# overwrite, so it keeps running while the tool says it succeeded (#849).
+foreign_jury_note() {
+    if [ -e "$2/jury" ] && [ ! -L "$2/jury" ]; then
+        case "$1" in
+            pipx) fix="pipx install --force ai-jury" ;;
+            uv) fix="uv tool install --force ai-jury" ;;
+            Homebrew) fix="brew link --overwrite ai-jury" ;;
+            *) fix="" ;;
+        esac
+        say "👉 Note: $2/jury is not the link $1 creates — an older jury is in the way,"
+        say "   and it is the one that runs. Remove it and run this again."
+        if [ -n "$fix" ]; then
+            say "   Or let $1 replace it: $fix"
+        fi
+    fi
+}
+
 # Report success and exit. $1 names the method, $2 is the directory the method
 # puts `jury` in. That directory may not be on PATH yet, so say where it is
 # rather than claim it is runnable.
 finish() {
     if command -v jury >/dev/null 2>&1; then
         say "✨ ai-jury installed via $1."
+        # A `jury` earlier on PATH — the old installer's `pip install --user`, say —
+        # would keep running while this reported success (#849). Compare the real
+        # directories, so a symlinked bin dir on PATH is not reported as a stranger.
+        on_path=$(command -v jury)
+        if [ -x "$2/jury" ] && [ "$(real_dir "$(dirname "$on_path")")" != "$(real_dir "$2")" ]; then
+            say "👉 Note: the \`jury\` on your PATH is $on_path, not the one just installed"
+            say "   at $2/jury. Remove the older one, or put $2 earlier on PATH."
+        fi
+        foreign_jury_note "$1" "$2"
         jury --version
     else
         say "✨ ai-jury installed via $1 to $2/jury."
+        foreign_jury_note "$1" "$2"
         say "👉 $2 is not on your PATH yet. Add it, e.g.:"
         say "   export PATH=\"$2:\$PATH\""
         "$2/jury" --version
@@ -60,8 +96,19 @@ tool_bin_dir() {
                 printf '%s\n' "${PIPX_BIN_DIR:-$HOME/.local/bin}"
             ;;
         uv)
-            uv tool dir --bin </dev/null 2>/dev/null ||
-                printf '%s\n' "${UV_TOOL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+            # uv's own order: UV_TOOL_BIN_DIR, XDG_BIN_HOME, $XDG_DATA_HOME/../bin,
+            # then ~/.local/bin.
+            uv tool dir --bin </dev/null 2>/dev/null || {
+                if [ -n "${UV_TOOL_BIN_DIR:-}" ]; then
+                    printf '%s\n' "$UV_TOOL_BIN_DIR"
+                elif [ -n "${XDG_BIN_HOME:-}" ]; then
+                    printf '%s\n' "$XDG_BIN_HOME"
+                elif [ -n "${XDG_DATA_HOME:-}" ]; then
+                    printf '%s\n' "$XDG_DATA_HOME/../bin"
+                else
+                    printf '%s\n' "$HOME/.local/bin"
+                fi
+            }
             ;;
     esac
 }
@@ -76,8 +123,14 @@ main() {
     # 1. Homebrew
     if command -v brew >/dev/null 2>&1; then
         say "==> Installing via Homebrew (berkayturanci/ai-jury/ai-jury)..."
-        if brew install berkayturanci/ai-jury/ai-jury </dev/null && command -v jury >/dev/null 2>&1; then
-            finish Homebrew "$(dirname "$(command -v jury)")"
+        # Judge success by Homebrew's own bin directory, not by `command -v jury`:
+        # an older jury earlier on PATH would pass that test and be reported as the
+        # new install (#850 review).
+        if brew install berkayturanci/ai-jury/ai-jury </dev/null; then
+            brew_bin="$(brew --prefix </dev/null 2>/dev/null)/bin"
+            if [ -x "$brew_bin/jury" ]; then
+                finish Homebrew "$brew_bin"
+            fi
         fi
         say "   Homebrew did not produce a working jury; trying the next method."
     fi

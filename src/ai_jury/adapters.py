@@ -1212,18 +1212,29 @@ def _open(target, timeout):
 
 
 def list_local_models(endpoint: str = _DEFAULT_LOCAL_ENDPOINT) -> list[str]:
+    """Model ids a local server lists, or ``[]`` — see :func:`local_model_listing`.
+
+    ``[]`` means both "the server lists none" and "the listing failed". Callers that
+    must tell those apart (the doctor: a server with nothing pulled cannot review)
+    use :func:`local_model_listing`, which answers ``None`` for a failed listing.
+    """
+    return local_model_listing(endpoint) or []
+
+
+def local_model_listing(endpoint: str = _DEFAULT_LOCAL_ENDPOINT) -> list[str] | None:
     """List model ids from a local OpenAI-compatible server (issue #109).
 
     GETs ``{endpoint}/models`` (the OpenAI-compatible listing that Ollama,
     vLLM, LM Studio, etc. expose) and returns the model ids in their reported
     order. Best-effort and stdlib-only: any failure (server down, bad JSON)
-    returns ``[]`` so callers can fall back gracefully.
+    returns ``None`` — distinct from ``[]``, a server that answered and lists no
+    model — so callers can fall back gracefully.
 
     The endpoint is validated here at the seam (issue #309) so EVERY caller —
     including the un-gated ``jury init --local-endpoint`` discovery path — gets
     the same SSRF gate that ``config._endpoint_issues`` enforces for config-file
     endpoints: a non-``http(s)`` scheme or a non-loopback host (without the
-    ``JURY_ALLOW_REMOTE_ENDPOINT`` opt-in) yields ``[]`` without any network call.
+    ``JURY_ALLOW_REMOTE_ENDPOINT`` opt-in) yields ``None`` without any network call.
     """
     import json as _json
 
@@ -1233,17 +1244,23 @@ def list_local_models(endpoint: str = _DEFAULT_LOCAL_ENDPOINT) -> list[str]:
     try:
         # SSRF gate INSIDE the try (review of #309): `_endpoint_issues` calls
         # urlsplit, which raises ValueError on a malformed URL (e.g. `http://[::1`);
-        # keep the best-effort "any failure -> []" contract rather than crashing.
+        # keep the best-effort "any failure -> None" contract rather than crashing.
         if _endpoint_issues(base, "local-endpoint")[0]:  # hard-error issues -> refuse
-            return []
+            return None
         url = base if base.endswith("/models") else f"{base}/models"
         with _open(url, _VERSION_PROBE_TIMEOUT) as resp:  # noqa: S310
             data = _json.loads(resp.read(_MAX_RESPONSE_BYTES).decode("utf-8", errors="replace"))
     except Exception:  # noqa: BLE001 - discovery is best-effort
+        return None
+    if not isinstance(data, dict) or "data" not in data:
+        return None
+    models = data["data"]
+    if models is None:
+        # Ollama with nothing pulled answers `{"object": "list", "data": null}`, not
+        # `"data": []` (measured on Ollama 0.34.1) — the very server #849 is about.
         return []
-    models = data.get("data") if isinstance(data, dict) else None
     if not isinstance(models, list):
-        return []
+        return None
     ids = [m.get("id") for m in models if isinstance(m, dict) and m.get("id")]
     return [str(i) for i in ids]
 

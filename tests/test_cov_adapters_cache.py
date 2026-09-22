@@ -85,6 +85,54 @@ class AdaptersCoverageTests(unittest.TestCase):
         )
         self.assertIn("P", a._stdin_for("P"))  # the prompt travels on stdin (#287)
 
+    def test_local_model_listing_says_none_when_the_listing_fails(self):
+        """#849: `local_model_listing` tells "lists nothing" (`[]`) from "could not
+        list" (`None`); `list_local_models` folds both to `[]` for its callers. A 200
+        with an unexpected shape, a refused host and an unreachable server are all
+        "could not list" — the doctor must not call such a seat empty."""
+        cases = [
+            ("a dict whose data is not a list", {"return_value": _Resp(json.dumps({"data": {}}))}),
+            ("no data key", {"return_value": _Resp(json.dumps({"object": "list"}))}),
+            ("unreachable", {"side_effect": urllib.error.URLError("refused")}),
+        ]
+        for label, kwargs in cases:
+            with self.subTest(label), mock.patch("ai_jury.adapters._open", **kwargs):
+                self.assertIsNone(adapters.local_model_listing("http://localhost:11434/v1"))
+        with mock.patch("ai_jury.adapters._open", side_effect=AssertionError("network")):
+            self.assertIsNone(adapters.local_model_listing("http://169.254.169.254/latest"))
+
+    def test_local_model_listing_says_empty_when_the_server_lists_nothing(self):
+        with mock.patch("ai_jury.adapters._open", return_value=_Resp(json.dumps({"data": []}))):
+            self.assertEqual(adapters.local_model_listing("http://localhost:11434/v1"), [])
+
+    def test_ollama_with_nothing_pulled_is_empty_not_unknown(self):
+        """#850 third seat, measured on Ollama 0.34.1 with no model pulled: `/v1/models`
+        answers `data: null`, not `data: []`. That is the server #849 is about, so it
+        must read as "lists nothing", through the doctor as well."""
+        from types import SimpleNamespace
+
+        from ai_jury import doctor
+
+        body = json.dumps({"object": "list", "data": None})
+        with mock.patch("ai_jury.adapters._open", return_value=_Resp(body)):
+            self.assertEqual(adapters.local_model_listing("http://localhost:11434/v1"), [])
+            spec = SimpleNamespace(name="q", vendor="local", endpoint=None, model="m")
+            self.assertEqual(doctor._local_model_gap(spec)[0], "unusable")
+
+    def test_the_doctor_does_not_call_an_unlistable_server_empty(self):
+        """Through the real function: a 200 with no `data` is no evidence, not "empty"."""
+        from types import SimpleNamespace
+
+        from ai_jury import doctor
+
+        spec = SimpleNamespace(name="q", vendor="local", endpoint=None, model="m")
+        with mock.patch(
+            "ai_jury.adapters._open", return_value=_Resp(json.dumps({"object": "list"}))
+        ):
+            self.assertIsNone(doctor._local_model_gap(spec))
+        with mock.patch("ai_jury.adapters._open", return_value=_Resp(json.dumps({"data": []}))):
+            self.assertEqual(doctor._local_model_gap(spec)[0], "unusable")
+
     def test_list_local_models_data_not_list(self):
         # Line 357: a well-formed dict whose "data" is not a list -> [].
         body = json.dumps({"data": {"not": "a list"}})
