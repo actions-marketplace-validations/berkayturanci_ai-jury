@@ -2815,11 +2815,48 @@ def main(argv: list[str] | None = None) -> int:
         # machine-readable document must still go to stdout.
         print(report)
 
+    # The read side of `gh` has been guarded since #836; the write side was not (#844).
+    # By the time control reaches here the panel has run and the verdict is already on
+    # stdout, so a `gh` failure — missing CLI, bad token, no write permission, a deleted
+    # PR, a timeout, a refused spawn — must not replace a finished review with a traceback
+    # and exit 1. The two kinds are deliberately different:
+    #
+    #   * `--post-summary` is a contract. Asking for the verdict to be posted and not
+    #     posting it is a failure of the run, so it exits 2 like every other user error.
+    #   * `--post-inline` and `--label` are additions to a review that has already been
+    #     delivered. They report the failure and leave `ci_exit` — the gate's own answer
+    #     about the code — intact, because losing it would turn "the code is fine, GitHub
+    #     hiccuped" into "the gate failed".
+    def _post(action: str, call, *, contractual: bool) -> bool:
+        """Run *call*, reporting a `gh` failure instead of letting it escape.
+
+        Returns **whether the post landed**, so no caller can log a success that
+        did not happen. An earlier version returned `2 if contractual else None`,
+        which made failure and success indistinguishable for the non-contractual
+        callers — both were `None` — and `--post-inline` printed the error and the
+        "posted inline comments" line one after the other.
+        """
+        try:
+            call()
+        except RuntimeError as exc:
+            # `contractual` is the severity: failing a promise is an error, failing
+            # an addition to a verdict that did land is a warning. Printing both as
+            # `error:` while exiting 0 told the reader the opposite of the exit code.
+            prefix = "error" if contractual else "warning"
+            print(f"{prefix}: could not {action}: {redact(str(exc))[0]}", file=sys.stderr)
+            return False
+        return True
+
     if args.post_summary:
         if args.issue:
             # Plain issues use `gh issue comment`; phased/SHA-marker posting is
             # PR-only, so the issue path posts the single rendered report.
-            post_issue_comment(args.issue, report, args.repo)
+            if not _post(
+                f"post the verdict to issue #{args.issue}",
+                lambda: post_issue_comment(args.issue, report, args.repo),
+                contractual=True,
+            ):
+                return 2
             log(f"posted verdict to issue #{args.issue}")
             return ci_exit
         if not args.pr:
@@ -2829,7 +2866,24 @@ def main(argv: list[str] | None = None) -> int:
         from .github import pr_head_sha
         from .incremental import reviewed_sha_marker
 
-        marker_sha = head_sha or pr_head_sha(args.pr, args.repo)
+        # A missing marker costs a later `--incremental` run its narrowing; it is not
+        # worth refusing to post the verdict over, so this one degrades rather than exits.
+        # `pr_head_sha` is best-effort: it catches its own `gh` failure and returns
+        # "". An earlier version of this guard wrapped it in `try/except RuntimeError`,
+        # which is unreachable — the warning it promised could never print, and the
+        # test only passed because it mocked `pr_head_sha` itself rather than the `gh`
+        # call underneath. The empty string is the failure signal, so that is what is
+        # checked.
+        if head_sha:
+            marker_sha = head_sha
+        else:
+            marker_sha = pr_head_sha(args.pr, args.repo)
+            if not marker_sha:
+                print(
+                    "warning: could not read the PR head sha, so this review will not "
+                    "carry an incremental marker",
+                    file=sys.stderr,
+                )
         marker = f"\n\n{reviewed_sha_marker(marker_sha)}" if marker_sha else ""
 
         if args.post_mode == "phased":
@@ -2850,17 +2904,35 @@ def main(argv: list[str] | None = None) -> int:
             )
             for i, (title, body) in enumerate(sections):
                 tail = marker if i == len(sections) - 1 else ""
-                post_pr_comment(args.pr, f"## {title}\n\n{body}{tail}", args.repo)
+                if not _post(
+                    f"post phased comment {i + 1} of {len(sections)} to PR #{args.pr}",
+                    lambda t=title, b=body, x=tail: post_pr_comment(
+                        args.pr, f"## {t}\n\n{b}{x}", args.repo
+                    ),
+                    contractual=True,
+                ):
+                    return 2
             log(f"posted {len(sections)} phased comments to PR #{args.pr}")
         else:
-            post_pr_comment(args.pr, f"{report}{marker}", args.repo)
+            if not _post(
+                f"post the verdict to PR #{args.pr}",
+                lambda: post_pr_comment(args.pr, f"{report}{marker}", args.repo),
+                contractual=True,
+            ):
+                return 2
             log(f"posted verdict to PR #{args.pr}")
 
     if args.post_inline:
         if not args.pr:
             raise SystemExit("error: --post-inline requires --pr")
-        post_inline_comments(args.pr, outcome.findings, repo=args.repo, dry_run=args.dry_run)
-        log(f"posted inline comments to PR #{args.pr}")
+        if _post(
+            f"post inline comments to PR #{args.pr}",
+            lambda: post_inline_comments(
+                args.pr, outcome.findings, repo=args.repo, dry_run=args.dry_run
+            ),
+            contractual=False,
+        ):
+            log(f"posted inline comments to PR #{args.pr}")
 
     # Optional GitHub labels (issue #7): OFF by default. Only applied when
     # --label is passed AND a --pr target exists; never automatic.
@@ -2868,8 +2940,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.pr:
             raise SystemExit("error: --label requires --pr")
         labels = label_strings(classify(outcome))
-        apply_labels(args.pr, labels, args.repo)
-        log(f"applied labels to PR #{args.pr}: {', '.join(labels)}")
+        if _post(
+            f"apply labels to PR #{args.pr}",
+            lambda: apply_labels(args.pr, labels, args.repo),
+            contractual=False,
+        ):
+            log(f"applied labels to PR #{args.pr}: {', '.join(labels)}")
 
     return ci_exit
 
