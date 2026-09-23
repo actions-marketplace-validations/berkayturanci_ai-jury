@@ -161,6 +161,53 @@ class PackagingMetadataIsComplete(unittest.TestCase):
             f"the declared Python classifiers have a gap: {declared}",
         )
 
+    def test_every_classified_python_is_one_ci_runs(self):
+        """A classifier is a claim; CI is what backs it (#849). Declaring 3.14 before
+        any job ran on it is the drift this catches."""
+        supported = re.compile(r"Programming Language :: Python :: (3\.\d+)")
+        declared = {
+            found.group(1)
+            for found in (supported.fullmatch(c) for c in self.project["classifiers"])
+            if found
+        }
+        # Only the `test` job's `strategy.matrix` block counts: other jobs pin one
+        # Python to run a tool, and a `python-version:` in a step's `with:` or `env:`
+        # is not a leg. Comments are dropped, so a version parked in one does not
+        # count. Two things the check cannot model are refused instead: an
+        # `exclude:` (it drops a listed version) and `continue-on-error` in the test
+        # job (it lets a red leg pass) — drop the version from the list instead.
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        tested: set[str] = set()
+        job, matrix_indent = None, None
+        for raw in workflow.splitlines():
+            line = raw.split("#", 1)[0].rstrip()
+            if not line:
+                continue
+            indent = len(line) - len(line.lstrip())
+            header = re.fullmatch(r"  ([\w-]+):", line)
+            if header or indent == 0:
+                job, matrix_indent = (header.group(1) if header else None), None
+                continue
+            if job != "test":
+                continue
+            if re.match(r"\s*continue-on-error:", line):
+                self.fail("the test job has continue-on-error, so a red 3.x leg would pass")
+            if re.fullmatch(r"\s*matrix:", line):
+                matrix_indent = indent
+                continue
+            if matrix_indent is not None and indent <= matrix_indent:
+                matrix_indent = None
+            if matrix_indent is None:
+                continue
+            if re.match(r"\s*exclude:", line):
+                self.fail("the test matrix has an exclude:; remove the version instead")
+            if re.match(r"\s*(- )?python-version:", line):
+                tested.update(re.findall(r"3\.\d+", line))
+        self.assertGreaterEqual(tested, {"3.11", "3.12", "3.13"}, "the test matrix was not read")
+        self.assertEqual(
+            declared - tested, set(), f"classified but never tested: {declared - tested}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
