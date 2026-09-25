@@ -368,7 +368,9 @@ Notes:
   only when an effort level is set, and at most once per run per agent.
 - **`local` is deliberately excluded.** Many local OpenAI-compatible servers
   reject an unknown request field outright, which would turn a hint into a failed
-  review; effort is not sent on speculation.
+  review; effort is not sent on speculation. For a local reasoning model, set the
+  level in the model itself. For example, an Ollama Modelfile can rewrite
+  gpt-oss's template default `Reasoning: medium` to `low`.
 - **`openai-compatible` is only as good as the provider behind it.** The vendor
   covers OpenRouter, DeepSeek, Groq, Mistral, LiteLLM and any other
   OpenAI-shaped endpoint, and `reasoning_effort` is sent to all of them. A
@@ -383,6 +385,43 @@ Notes:
   a clear message.
 - Effort is part of the config hash, so two runs that differ only by effort do
   not share a cache entry.
+
+## Sampling temperature (`[[agent]] temperature`, local seats)
+
+A local seat sends `temperature: 0` (greedy decoding) unless it is told
+otherwise. Greedy is the right default for a reviewer, and most models are fine
+with it. Some are not. Replaying a real jury prompt (a 36 KB diff) against
+gpt-oss 20B on Ollama:
+
+| `temperature` | Result |
+|---|---|
+| `0` | reasoning looped ("Ok." ×164, "Stop." ×48) to the 8,192-token output cap; **no answer** (`empty_output`, or a timeout without a cap) |
+| `1` | a review in 164 s, with its `Checked:` and `Tested:` lines |
+
+A model's own `PARAMETER temperature` cannot help, because the request value
+overrides it. So the seat takes the setting:
+
+```toml
+[[agent]]
+name = "gpt-oss"
+vendor = "local"
+model = "gpt-oss:20b"
+temperature = 1.0      # OpenAI's recommended setting for gpt-oss; 0 loops
+```
+
+- **Local seats only.** It is sent by the `local` adapter, which is decided by the
+  seat's [adapter](#identity-vs-protocol-the-adapter-key), not its vendor. On any
+  other seat it is a warning (`temperature applies only to local seats`) and is
+  ignored, because hosted and CLI seats own their own sampling.
+- **Unset changes nothing.** The request carries the same literal `0` as before
+  this key existed, and the config hash gains nothing, so existing cache entries
+  stay valid. Set it only for a model that needs it.
+- **Validated like `effort`.** A number from `0` to `2`, the OpenAI range, which
+  every OpenAI-compatible server accepts. A string, a boolean, `nan`, or a value
+  out of range is a **hard config error**: a silent fallback to `0` would bring
+  back exactly the empty review the operator set it to fix.
+- Part of the config hash when set, so runs at different temperatures do not
+  share a cache entry.
 
 ## Machine-readable diagnostics (`jury --doctor --json`)
 
@@ -399,7 +438,7 @@ The document is `schema_version: "ai-jury.doctor.v1"`:
 ```json
 {
   "schema_version": "ai-jury.doctor.v1",
-  "tool_version": "1.18.1",
+  "tool_version": "1.20.0",
   "python": "3.12.14",
   "config_path": "/path/to/jury.toml",
   "ready": true,
@@ -734,6 +773,13 @@ name = "local-lmstudio"
 vendor = "local"
 model = "local-model"
 endpoint = "http://localhost:1234/v1"
+
+# A reasoning model that loops under greedy decoding (see "Sampling temperature")
+[[agent]]
+name = "local-gpt-oss"
+vendor = "local"
+model = "gpt-oss:20b"
+temperature = 1.0
 ```
 
 > **Remote Endpoint Security Note:** By default, endpoints for `vendor = "local"` and `openai-compatible` are restricted to loopback interfaces (`localhost`, `127.0.0.1`, `::1`) to guard against unintended SSRF. If pointing to a trusted remote host, set `JURY_ALLOW_REMOTE_ENDPOINT=1` in your environment.
@@ -774,22 +820,61 @@ invalidated by this.
 
 #### Custom Pluggable Python Adapter
 
+For a backend that is neither a coding-agent CLI (`vendor = "cli"`) nor an
+OpenAI-/Anthropic-compatible HTTP endpoint, subclass `Adapter`, override `run()`
+to call your backend, and return an `AgentResult`:
+
 ```python
-from ai_jury.adapters import BaseAdapter, register_adapter, AgentResult
+# docs-exec: custom-adapter — this block is executed verbatim by
+# tests/test_docs_python_snippets.py, so it must import and run as written.
+from ai_jury.adapters import Adapter, AgentResult, register_adapter
 
 
-class CustomCompanyAdapter(BaseAdapter):
-    def invoke(self, prompt: str, timeout: float) -> AgentResult:
-        # Custom HTTP, gRPC, or CLI logic here
-        return AgentResult(ok=True, text="Response from custom adapter")
+class CustomCompanyAdapter(Adapter):
+    def available(self) -> bool:
+        return True  # whether your backend is reachable (shown by --doctor)
+
+    def run(self, prompt, phase="review", timeout=None, role_policy=None):
+        # Call your HTTP/gRPC/SDK backend with `prompt` and return its text.
+        # `phase` is "review", "debate", or "verify"; a reviewer emits a fenced
+        # JSON findings block the panel parses out of `output`. This stub returns
+        # an empty review so the example runs offline.
+        review_text = "Checked: src/example.py\nTested: nothing\n[]"
+        return AgentResult(
+            agent=self.name,
+            vendor=self.spec.vendor,
+            ok=True,
+            output=review_text,
+            duration_s=0.0,
+        )
 
 
-# Register custom vendor
+# Teach this build the vendor name so a seat can select it.
 register_adapter("company-llm", CustomCompanyAdapter)
 ```
+
+Reference it from a seat like any built-in vendor (no `command` — your `run()`
+is the invocation):
+
 ```toml
 [[agent]]
 name = "internal-llm"
 vendor = "company-llm"
 model = "company-v1"
+```
+
+The `jury` CLI reviews with the adapters compiled into the build — it does not
+import external Python, so there is no `--load` flag. Register your adapter in
+the **same process** that runs the panel, i.e. drive the jury from Python:
+
+```python
+from ai_jury.config import load_config
+from ai_jury.orchestrator import review_diff
+
+# ...after the register_adapter(...) call above has run in this process...
+config = load_config("jury.toml")  # the seat above selects vendor = company-llm
+with open("changes.diff", encoding="utf-8") as fh:
+    diff = fh.read()
+outcome, _plan = review_diff(config, diff)  # runs the panel with your adapter
+print(len(outcome.findings), "finding(s)")
 ```

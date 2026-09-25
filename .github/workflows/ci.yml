@@ -29,11 +29,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Full Python-version coverage on Linux; the latest supported Python on
-        # macOS and Windows to prove cross-OS CLI/subprocess behavior while keeping
-        # the matrix small and cheap. See docs/architecture.md for OS notes.
+        # Full Python-version coverage on Linux; one Python (3.13) on macOS and
+        # Windows to prove cross-OS CLI/subprocess behavior while keeping the matrix
+        # small and cheap. Every version a classifier declares must appear here —
+        # tests/test_release_metadata.py checks it. See docs/architecture.md.
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         include:
           - os: macos-latest
             python-version: "3.13"
@@ -47,8 +48,8 @@ jobs:
       # `timeout(1)` is GNU coreutils and the `macos-latest` runner ships neither
       # it nor `gtimeout`, so a `timeout 300` here exits 127 on that leg before
       # pip is reached — a red required check on every pull request rather than a
-      # bound. One step serves all five matrix legs, so the bound has to be one
-      # all five have, and `bounded` is that: `subprocess.run(timeout=…)`, which
+      # bound. One step serves every matrix leg, so the bound has to be one
+      # they all have, and `bounded` is that: `subprocess.run(timeout=…)`, which
       # kills the child and exits non-zero on Linux, macOS and Windows alike. The
       # interpreter is the one `setup-python` installed in the step above, so it
       # is already here and is the same on every leg.
@@ -142,7 +143,7 @@ jobs:
   version-integrity:
     # Its own job, not a step in the test matrix, for one reason: the check needs
     # the git tags, and fetching them means a full-history checkout. Paying that
-    # on five matrix combinations to run the same assertion five times is waste;
+    # on every matrix combination to run the same assertion once per leg is waste;
     # paying it once here is not. #556 — before this, the step ran inside `test`
     # with the default shallow checkout, so `git tag -l` was empty and the
     # monotonicity comparison silently did nothing on every run.

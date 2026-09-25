@@ -13,9 +13,10 @@ availability detection, and writing the file.
 
 from __future__ import annotations
 
+import math
 from urllib.parse import urlsplit
 
-from .config import DEFAULT_CONFIG
+from .config import AGY_AGENT, DEFAULT_CONFIG, adapter_key
 
 _LOCAL_TEMPLATE = {
     "name": "qwen",
@@ -62,10 +63,22 @@ _GENERIC_CLI_TEMPLATE = {
 
 
 def _from_default(name: str) -> dict | None:
-    for a in DEFAULT_CONFIG.get("agent", []):
+    for a in [*DEFAULT_CONFIG.get("agent", []), AGY_AGENT]:
         if a.get("name") == name:
             return dict(a)
     return None
+
+
+#: Templates `jury init` writes only when they are named: never picked by
+#: "detected", "all", or an interactive default. agy cannot be confined for a
+#: reviewer of untrusted diffs (see ``config.AGY_AGENT``), so seating it is the
+#: operator's explicit decision, and `jury init` says so when it writes one.
+OPT_IN_AGENTS: tuple[str, ...] = ("agy",)
+
+
+def implicit_choices(names) -> list[str]:
+    """*names* without the opt-in-only agents: what a default may pick."""
+    return [n for n in names if n not in OPT_IN_AGENTS]
 
 
 def agent_templates() -> dict[str, dict]:
@@ -155,7 +168,9 @@ def pick_default_model(models: list[str]) -> str | None:
 # Named setup presets (issue: easier config). Each gives default agents +
 # settings for a common intent; explicit flags / detected agents override the
 # `agents` value ("detected" = the agents available right now, "all" = every
-# known agent). Resolved by the CLI, which knows availability.
+# known agent). Resolved by the CLI, which knows availability. Neither
+# "detected" nor "all" includes an OPT_IN_AGENTS entry: a preset is a default,
+# and agy is only ever seated by name.
 PRESETS: dict[str, dict] = {
     "offline": {"agents": ["qwen"], "rounds": 1, "verify": False},
     "fast": {"agents": "detected", "rounds": 1, "verify": False},
@@ -261,6 +276,10 @@ def _scalar(value) -> str:
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        # `repr` is a valid TOML float for every finite value ("1.0", "0.7",
+        # "1e-05"). A non-finite one is refused below: no config key accepts it.
+        return repr(value)
     if isinstance(value, str):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
@@ -274,11 +293,26 @@ def _render_value(value) -> str:
 
 
 # Stable key order for agent tables so output is deterministic and readable.
-_AGENT_KEY_ORDER = ("name", "vendor", "command", "endpoint", "model", "effort", "extra_args")
+_AGENT_KEY_ORDER = (
+    "name",
+    "vendor",
+    "command",
+    "endpoint",
+    "model",
+    "effort",
+    "temperature",
+    "extra_args",
+)
 
 #: Commented hint written under every effort-capable agent that has no explicit
 #: level, so the setting is discoverable from the generated file itself.
 _EFFORT_HINT = '# effort = "medium"    # low | medium | high'
+
+#: Commented hint written under every local seat with no explicit temperature.
+#: Commented, not set: the default model does not need it, and a written value
+#: would split every generated config's hash for nothing. It is here so the
+#: operator who picks a model that loops at the greedy default finds the knob.
+_TEMPERATURE_HINT = "# temperature = 1.0   # default 0; set 1.0 for models that loop at 0 (gpt-oss)"
 
 
 #: Written under every scaffolded ``[jury.ci]`` (issue #682). Commented out,
@@ -355,6 +389,12 @@ def render_toml(config: dict) -> str:
         # ever produces an "effort unsupported" warning.
         if not agent.get("effort") and _effort_supported(agent.get("vendor", "")):
             lines.append(_EFFORT_HINT)
+        # Only local seats send a temperature, and which adapter a seat runs
+        # through decides that, not its vendor, the same rule validation uses.
+        if agent.get("temperature") is None and (
+            adapter_key(agent.get("vendor", ""), agent.get("adapter")) == "local"
+        ):
+            lines.append(_TEMPERATURE_HINT)
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

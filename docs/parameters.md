@@ -68,8 +68,9 @@ jury --pr 123 --rounds 1
 #   → each agent reviews once; skips the debate round (a fixed value disables early-stop)
 
 # Offline demo with deterministic mock agents (no CLIs, no network)
-jury --mock --diff-file examples/sample.diff
-#   → exercise the full pipeline locally; byte-identical output every run
+jury --mock
+#   → reviews a diff bundled with the package; byte-identical output every run
+#   → point it at your own change with --diff-file <path> or --diff-file -
 
 # Run ONE agent for one role and get a JSON result (orchestrator integration)
 jury run-agent --agent claude --role review --prompt-file gate.md
@@ -439,7 +440,7 @@ run`) or a CI script. See the [cookbook recipe](cookbook.md#21-run-one-agent-for
 | `--agent` | name \| `vendor[:model]` | A `[[agent]]` name from `jury.toml`, or a built-in vendor (`claude`, `codex`, `agy`, `anthropic-api`, `openai-api`, `google-api`, `xai-api`). A configured entry wins over a built-in of the same name. `:model` overrides the model. |
 | `--role` | `implement` \| `review` \| `gate` \| `chair` \| `fix` | What the agent is asked to do. Decides privilege — see below. |
 | `--prompt-file` | path \| `-` | The prompt to send (`-` reads stdin; not allowed with `--detach`). |
-| `--cwd` | directory | Run the agent in this directory (default: the current one). |
+| `--cwd` | directory | The directory a write role (`implement`/`fix`) runs in (default: the current one). The read-only roles on `claude`, `codex` and `agy` start in a fresh, empty temporary directory instead, and passing `--cwd` to one prints a note. |
 | `--timeout` | seconds | Wall-clock bound on the **agent** (default: the agent's configured timeout). It never bounds a `--wait` — that is `--wait-timeout`. |
 | `--effort` | `low` \| `medium` \| `high` | Reasoning [effort](#reasoning-effort---effort--agent-effort) for vendors that support one; warns and is ignored otherwise. |
 | `--allow-write` | flag | Grant the vendor's write/tool mode. **Required** by `implement`/`fix`; warned about and ignored by the read-only roles. |
@@ -594,6 +595,7 @@ transcript = true   # default the markdown report to the full play-by-play
 | `headers` | table of strings | `{}` | Custom HTTP headers map for `openai-compatible` API calls. A `headers` that is not a table (a bare string, an array) is a **hard** config error naming the agent, because it cannot become headers at all — as is a non-string header name. A non-string **value** (`X-Retries = 3`) **warns** and is coerced to a string before being sent, like a malformed `api_key_env` that falls back; `--strict-config` makes that fatal. Part of the config hash, so two seats differing only in a routing header do not share a cache entry. No message quotes the offending value back — a header is where a bearer token lives. |
 | `effort` | string | unset | `low` \| `medium` \| `high`. Reasoning effort, mapped per vendor (see [effort](configuration.md#reasoning-effort-agent-effort----effort)). An unknown value is a hard config error; a vendor with no effort control warns once and ignores it. Overridden by `--effort`. |
 | `tier` | string | `frontier` | `frontier` \| `economical`. The seat's cost tier, read by `routing = "tiered"` (see [tiered routing](configuration.md#tiered-routing-routing--tiered--static-hints-hints--true)): economical seats sit on routine diffs, frontier seats anchor them and are benched otherwise. The operator says which is which — there are no model-name heuristics. An unknown value is a hard config error. Part of the config hash only when set to `economical`, so an existing config's cache entries are unchanged. |
+| `temperature` | number | unset (`0`) | `0`–`2`. Sampling temperature a **local** seat sends (see [temperature](configuration.md#sampling-temperature-agent-temperature-local-seats)). Unset keeps the greedy `0`; gpt-oss needs `1`. Out of range or non-numeric is a hard config error; on a non-local seat it warns and is ignored. Part of the config hash only when set. |
 | `timeout` | int | `600` | Positive seconds (inherits `jury.timeout`). |
 | `enabled` | bool | `true` | Disabled agents are skipped. |
 | `extra_args` | list[str] | `[]` | Extra CLI args (e.g. the secure-default sandbox flags). |

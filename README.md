@@ -18,11 +18,11 @@
 
 > **Install once. Run a cross-vendor review jury anywhere.**
 
-Most "multi-model review" tools call models at the **API level**. This one drives **any AI agent provider**: vendor native CLI agents (`claude`, `codex`, `agy`), hosted API providers (Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Mistral), free local open-weight models (Ollama, llama.cpp, vLLM, LM Studio), and arbitrary coding-agent CLIs (`vendor = "cli"` like Aider, Goose, OpenHands) — so every reviewer runs in its own environment with its own tooling. Each agent runs headless; the orchestrator owns the round structure.
+Most "multi-model review" tools call models at the **API level**. This one drives **any AI agent provider**: vendor native CLI agents (`claude`, `codex`, `agy`), hosted API providers (Anthropic, OpenAI, Gemini, xAI Grok, OpenRouter, DeepSeek, Groq, and any other OpenAI-compatible API such as Mistral), free local open-weight models (Ollama, llama.cpp, vLLM, LM Studio), and arbitrary coding-agent CLIs (`vendor = "cli"` like Aider, Goose, OpenHands) — so every reviewer runs in its own environment with its own tooling. Each agent runs headless; the orchestrator owns the round structure.
 
 ```
         ┌──────── round 1 ────────┐   ┌─ round 2 (adaptive) ─┐   ┌─ verify + synthesis ─┐
-diff ──▶ claude codex agy deepseek  ▶ each rebuts the      ▶ chair verifies, then   ▶ verdict
+diff ──▶ claude codex deepseek qwen ▶ each rebuts the      ▶ chair verifies, then   ▶ verdict
          (parallel, independent)           others' findings       consolidates             + report
 ```
 
@@ -48,10 +48,13 @@ curl -fsSL https://ai-jury.dev/install.sh | sh
 pipx install ai-jury
 ```
 
-Requires Python 3.11+. Then scaffold a config with **`jury init`** (it detects your
+Requires Python 3.11+. **Try it instantly, no config:** `jury --mock` runs the full
+offline deliberation on a diff bundled with the package (add `--theater` to watch the
+panel animate). Then scaffold a config with **`jury init`** (it detects your
 installed agents and local models). You need at least one reviewer: an agent CLI
 (`claude`, `codex`, `agy`, `aider`), a free local model via Ollama, **or** a hosted-API reviewer
-(Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, xAI Grok, Moonshot Kimi) — no CLI install or interactive login needed,
+(Anthropic, OpenAI, Gemini, xAI Grok, OpenRouter, DeepSeek, Groq — or Moonshot Kimi, Mistral or any other
+OpenAI-compatible API through `vendor = "openai-compatible"`) — no CLI install or interactive login needed,
 useful for CI and containers; missing/unreachable/unkeyed reviewers are skipped. `gh` is
 needed for `--pr` / `--post`.
 
@@ -352,9 +355,9 @@ jury --pr 123 --incremental               # review only changes since the last r
 
 ```bash
 git diff origin/HEAD... | jury --diff-file -   # review the current branch
-jury --diff-file examples/sample.diff          # review a diff file
-jury --rounds 1                                # independent review only (no debate)
-jury --mock --diff-file examples/sample.diff   # offline demo, no live CLIs
+jury --diff-file changes.diff                  # review a diff file
+jury --mock                                     # offline demo on a bundled sample, no live CLIs
+jury --mock --rounds 1                          # offline: independent review only (no debate)
 ```
 
 **Inspect:**
@@ -380,7 +383,7 @@ jury run-agent --agent codex:gpt-5.2 --role implement --allow-write --prompt-fil
 
 ```yaml
 - repo: https://github.com/berkayturanci/ai-jury
-  rev: v1.18.1
+  rev: v1.20.0
   hooks:
     - id: ai-jury
 ```
@@ -658,7 +661,9 @@ name = "claude"
 vendor = "anthropic"   # anthropic | openai | google | xai
 command = "claude"
 # model = "claude-opus-4-8"
-extra_args = ["--output-format", "text", "--disallowed-tools", "Edit,Write,NotebookEdit,Bash", "--dangerously-skip-permissions"]
+# The reviewer gets no tools (no file reads, shell, network or MCP servers), loads no
+# CLAUDE.md, hooks, skills or plugins, and keeps no transcript of the diff.
+extra_args = ["--output-format", "text", "--tools", "", "--disallowed-tools", "Edit,Write,NotebookEdit,Bash,Read,Grep,Glob,WebFetch,WebSearch,Task,Agent", "--strict-mcp-config", "--safe-mode", "--no-session-persistence", "--permission-mode", "dontAsk"]
 ```
 
 Override per run with `--rounds`, `--chair`, `--config`.
@@ -712,6 +717,11 @@ continues with the other agents). See the
 [benchmark note](benchmark/README.md#local--open-weight-reviewer-issue-43) for the
 measured diversity contribution.
 
+A local seat decodes greedily (`temperature = 0`) by default. Some reasoning
+models loop at 0 and never answer; gpt-oss is one of them. Give such a seat
+`temperature = 1.0`, which is what OpenAI recommends for gpt-oss. See
+[sampling temperature](docs/configuration.md#sampling-temperature-agent-temperature-local-seats).
+
 ## Repository review policy (optional)
 
 A repository under review may ship an optional, separate **review policy** that
@@ -753,8 +763,15 @@ redact_secrets = true   # scrub recognized secrets before sending (default on)
   reviewing with `--pr`) to improve review quality. Use this only when you trust
   the configured agent endpoints.
 
-Either way, no source files outside the diff, no repository history, and no
-environment variables are read or sent.
+Either way, the jury itself reads and sends no source files outside the diff, no
+repository history, and no environment variables. What an agent CLI can reach on
+its own, once started, depends on the seat: the shipped `claude` seat has no tools
+at all, the shipped `codex` seat can read any file your user can read by absolute
+path but not write or reach the network from its shell (and it loads the MCP
+servers in your `~/.codex/config.toml`), an `agy` seat — opt-in only, never in
+the default panel — can read and write files and reach the network, and a
+bring-your-own `cli` seat has whatever its own flags give it — see
+[Security & the Codex sandbox](#security--the-codex-sandbox).
 
 **Secret redaction** — before anything is sent to an agent, the diff (and any
 context) is passed through a redactor (`src/ai_jury/redaction.py`)
@@ -880,7 +897,7 @@ it differs from hosted, API-level, and other native-CLI tools, and
 
 ## Status
 
-Active (v1.18.1). The full pipeline runs end-to-end with the real CLIs and the offline
+Active (v1.20.0). The full pipeline runs end-to-end with the real CLIs and the offline
 `--mock` path is covered by tests. **Shipped:** structured findings + tiered consensus
 (consensus / majority / single-reviewer), a verification pass that drops false positives,
 **universal agent provider support** (cloud CLIs, hosted APIs, arbitrary coding-agent CLIs, local models),
@@ -904,7 +921,18 @@ issues are tracked under [milestones](https://github.com/berkayturanci/ai-jury/m
 
 The jury performs **read-only review orchestration** — it sends a diff to each agent CLI and collects their feedback; it does not apply edits.
 
-The Codex adapter pipes the prompt on **stdin** (`codex exec` with no positional prompt) so non-interactive runs never hang waiting for input, and defaults `extra_args` to **`["-s", "read-only"]`** — a secure-by-default sandbox. The diff is fetched by the jury (`gh`), not by codex, so the reviewer only needs to read its prompt and print findings; a prompt injection in the diff can't make it write files, run shell, or reach the network. The `agy` agent runs under `--sandbox`, and `claude` under a write-tool denylist, for the same reason.
+The Codex adapter pipes the prompt on **stdin** (`codex exec` with no positional prompt) so non-interactive runs never hang waiting for input, and defaults `extra_args` to **`["-s", "read-only"]`** — a secure-by-default sandbox. The diff is fetched by the jury (`gh`), not by codex, so the reviewer only needs to read its prompt and print findings; a prompt injection in the diff can't make it write files, and its shell has no network. The read-only sandbox does not stop it *reading* any file your user can read, by absolute path, and the MCP servers enabled in your own `~/.codex/config.toml` still load (they run outside its sandbox).
+
+What each seat can reach while it reads an attacker-controlled diff. The default panel — what runs with no `jury.toml` — is `claude` + `codex`; `agy` is **opt-in only**:
+
+| Seat | Shipped flags | Writes / shell | Reads files outside the diff | Network |
+| --- | --- | --- | --- | --- |
+| `claude` | `--tools ""`, a deny list naming every write, shell, read, network and subagent tool, `--strict-mcp-config`, `--safe-mode` (no CLAUDE.md, hooks, skills or plugins), `--no-session-persistence`, `--permission-mode dontAsk` | no | no — and with `--safe-mode` not even your own `~/.claude/CLAUDE.md` is loaded into its context | no |
+| `codex` | `-s read-only` | no writes; read-only shell | yes, by absolute path | not from its shell; user MCP servers from `~/.codex/config.toml` still load |
+| `agy` (opt-in) | `--sandbox --dangerously-skip-permissions` | yes — `--sandbox` did not stop it writing files | yes | yes |
+| `cli` / `xai` | yours | whatever your flags give it | whatever your flags give it | whatever your flags give it |
+
+Each row was measured with the shipped flags against Claude Code 2.1.236, codex-cli 0.155.0 and agy 1.2.9. **agy is not in the default panel** because it cannot be confined for untrusted diffs: agy has no flag that removes its tools, and `--sandbox` did not stop it. Seat it only by name (`jury init --agents agy`, or an `[[agent]]` in `jury.toml`) and only for diffs you trust; every run with an agy seat prints a least-privilege warning, and `--strict` fails on it. `claude`, `codex` and `agy` start every read-only call — each panel call, and `jury run-agent`'s review/gate/chair roles — in a fresh, empty temporary directory rather than the repository under review, so the instruction files, project settings (a `.claude/settings.json` hook ran from one before) and `.env` a checkout carries are not picked up; a bring-your-own seat runs where `jury` was started, with whatever permissions its own flags give it. Details in [docs/security.md](docs/security.md#other-agents).
 
 Need codex to write or reach the network for your flow? Widen `extra_args` for the `codex` agent in `jury.toml` (e.g. `-s workspace-write`). See [docs/security.md](docs/security.md) for details.
 
@@ -959,6 +987,7 @@ documented and a documented flag can't silently disappear.
 | Successful review (no `--ci`) | exits `0` |
 | `--ci` with blocking findings remaining | exits `1` (see `ci.evaluate_ci`) |
 | Fewer than `min_vendors` **distinct vendors contributed** a review | exits `3` — the cross-vendor guard, *not* a findings failure. Checked on every run, with or without `--ci`, and it outranks the `--ci` severity gate. Default `2` (`[jury.ci] min_vendors`); the default is scoped to runs that claimed cross-vendor consensus, so a config with fewer distinct vendors enabled than the threshold is never failed by it. An explicit `--min-vendors N` is enforced as asked. Opt out with `--no-min-vendors` (or `min_vendors = 0`); to fail at *startup* on a missing CLI instead, use `--strict`. |
+| **Every** seat that ran failed to return a result — a CLI that crashed or timed out, an API error, a local model that is not pulled | exits `3` — nothing was reviewed, so the run is *not* a pass and *not* a findings failure. Checked on every run and it outranks the `--ci` severity gate; `--no-min-vendors` does not waive it. A seat that answered in prose with no findings is an abstention, not a failure, so a clean single-seat run still exits `0`. `jury --doctor` names the usual cause (#849). |
 | Fewer **reviews** than `min_reviews` — a review is a panel ballot that named what it read and voted; neither the chair's synthesis record nor an abstaining ballot is one | exits `3` — the panel-size guard, *not* a findings failure, and it outranks the `--ci` severity gate. Off by default (`[jury.ci] min_reviews = 0`, `--min-reviews N`). When the *available* bench cannot reach even the ceiling, the run refuses **before** the panel runs and exits `2` with `error: panel too small before the panel runs: …`. |
 
 **Stable report headings** (substrings other tooling may parse):
@@ -970,7 +999,7 @@ flag, changing an error message or exit code, or altering a report heading —
 intentional, regenerate the help snapshot with
 `UPDATE_GOLDEN=1 PYTHONPATH=src python3 -m unittest tests.test_cli_contract`.
 The help-snapshot exact match is pinned to Python 3.13 argparse formatting; the
-flag-presence checks run on all supported versions (3.11–3.13).
+flag-presence checks run on all supported versions (3.11–3.14).
 
 ## Documentation
 

@@ -17,7 +17,9 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
+from importlib import resources
 from pathlib import Path
 
 from . import __version__, configtrust, panel
@@ -117,6 +119,17 @@ def _git_diff(argv: list[str], label: str) -> str:
     return _read_capped(io.StringIO(proc.stdout), label)
 
 
+def _bundled_sample_diff() -> str:
+    """The offline-demo diff shipped inside the package (issue #21).
+
+    Read from ``ai_jury/data/sample.diff`` via ``importlib.resources`` so it
+    resolves the same way from a wheel, a zipapp, or a source checkout — no
+    ``examples/`` directory and no repo needed. Kept byte-identical to
+    ``examples/sample.diff`` by a test.
+    """
+    return resources.files("ai_jury").joinpath("data/sample.diff").read_text(encoding="utf-8")
+
+
 def _read_diff(args) -> tuple[str, str]:
     """Return (diff, context)."""
     if getattr(args, "commit", None):
@@ -148,6 +161,19 @@ def _read_diff(args) -> tuple[str, str]:
             raise SystemExit(
                 f"error reading diff file '{args.diff_file}': {redact(str(exc))[0]}"
             ) from None
+    if getattr(args, "mock", False):
+        # Offline demo (issue #21): `--mock` with no diff source reviews a diff
+        # bundled in the package, so `jury --mock` / `jury --mock --theater`
+        # deliver the deliberation the docs promise on a fresh install — no
+        # checkout, no PR, no network. A real (non-`--mock`) run still requires
+        # an explicit source. Announced on stderr so the payments.py sample is
+        # never mistaken for the caller's own change.
+        print(
+            "no diff source given; reviewing the bundled offline-demo diff. "
+            "Pass --diff-file/--pr/--commit to review your own change.",
+            file=sys.stderr,
+        )
+        return _bundled_sample_diff(), ""
     raise SystemExit(
         "error: provide one of --pr, --issue, --diff-file, --commit, --commits "
         "(or --diff-file - for stdin)"
@@ -768,7 +794,7 @@ def _run_comment_command(rest: list[str]) -> int:
 _AGENT_BLURB = {
     "claude": "Claude Code (Anthropic)",
     "codex": "Codex CLI (OpenAI)",
-    "agy": "Antigravity (Google)",
+    "agy": "Antigravity (Google) — opt-in only, cannot be confined",
     "qwen": "local / open-weight via Ollama (free, offline)",
     "claude-api": "hosted Anthropic API (ANTHROPIC_API_KEY, no CLI needed)",
     "codex-api": "hosted OpenAI API (OPENAI_API_KEY, no CLI needed)",
@@ -778,6 +804,17 @@ _AGENT_BLURB = {
     "groq": "hosted Groq API (GROQ_API_KEY)",
     "aider": "generic CLI coding agent (Aider)",
 }
+
+
+def _default_init_agents(available: dict) -> list[str]:
+    """The agents an interactive `jury init` pre-fills: detected, never opt-in-only.
+
+    agy stays listed and can be typed in, but pressing Enter never seats it.
+    """
+    from .scaffold import KNOWN_AGENTS, implicit_choices
+
+    detected = implicit_choices(n for n in KNOWN_AGENTS if available.get(n))
+    return detected or implicit_choices(KNOWN_AGENTS)
 
 
 def _init_available() -> dict:
@@ -811,7 +848,7 @@ def _init_interactive(available: dict, input_fn=input, local_endpoint=None, mode
     for name in KNOWN_AGENTS:
         mark = "available" if available.get(name) else "not found"
         print(f"  - {name}: {_AGENT_BLURB[name]} [{mark}]", file=sys.stderr)
-    default_agents = [n for n in KNOWN_AGENTS if available.get(n)] or list(KNOWN_AGENTS)
+    default_agents = _default_init_agents(available)
     raw_agents = input_fn(f"\nAgents to include [default: {','.join(default_agents)}]: ").strip()
     agents = [a.strip() for a in raw_agents.split(",") if a.strip()] or default_agents
 
@@ -906,7 +943,7 @@ def _init_wizard(available: dict, input_fn=input, local_endpoint=None, models_fn
     for name in KNOWN_AGENTS:
         mark = "available" if available.get(name) else "not found"
         print(f"  - {name}: {_AGENT_BLURB[name]} [{mark}]", file=sys.stderr)
-    default_agents = [n for n in KNOWN_AGENTS if available.get(n)] or list(KNOWN_AGENTS)
+    default_agents = _default_init_agents(available)
     raw_agents = ask(f"\nReviewers to include [default: {','.join(default_agents)}]: ")
     agents = [a.strip() for a in raw_agents.split(",") if a.strip()] or default_agents
 
@@ -1003,12 +1040,14 @@ def _init_wizard(available: dict, input_fn=input, local_endpoint=None, models_fn
 
 def _run_init(rest: list[str]) -> int:
     """Handle ``jury init`` (issue #107): scaffold a jury.toml."""
-    from .config import ConfigError, validate_config
+    from .config import AGY_OPT_IN_NOTE, ConfigError, validate_config
     from .scaffold import (
         KNOWN_AGENTS,
+        OPT_IN_AGENTS,
         PRESETS,
         agents_needing_remote_opt_in,
         build_config,
+        implicit_choices,
         render_toml,
     )
 
@@ -1019,7 +1058,10 @@ def _run_init(rest: list[str]) -> int:
         help="setup preset: offline (local-only), fast (1 round), balanced "
         "(debate + early-stop), thorough (all agents + debate + verify)",
     )
-    sub.add_argument("--agents", help="comma-separated: claude,codex,agy,qwen")
+    sub.add_argument(
+        "--agents",
+        help="comma-separated: claude,codex,qwen (agy only by name: it cannot be confined)",
+    )
     sub.add_argument("--rounds", type=int, default=None)
     sub.add_argument("--chair")
     sub.add_argument("--verify", dest="verify", action="store_true", default=None)
@@ -1077,7 +1119,8 @@ def _run_init(rest: list[str]) -> int:
     preset = PRESETS.get(ns.preset, {})
 
     def _detected_agents():
-        return [n for n in KNOWN_AGENTS if available.get(n)]
+        # Never an opt-in-only agent (agy): "detected" is a default, not a choice.
+        return implicit_choices(n for n in KNOWN_AGENTS if available.get(n))
 
     def _selectable_agents():
         """Every known agent whose template scaffolds to a *valid* config here.
@@ -1090,9 +1133,9 @@ def _run_init(rest: list[str]) -> int:
         name; they are only excluded from "all" until the opt-in is present.
         """
         if os.environ.get("JURY_ALLOW_REMOTE_ENDPOINT"):
-            return list(KNOWN_AGENTS)
+            return implicit_choices(KNOWN_AGENTS)
         needs_opt_in = set(agents_needing_remote_opt_in())
-        return [n for n in KNOWN_AGENTS if n not in needs_opt_in]
+        return implicit_choices(n for n in KNOWN_AGENTS if n not in needs_opt_in)
 
     def _resolve_preset_agents(spec):
         if spec == "all":
@@ -1134,6 +1177,8 @@ def _run_init(rest: list[str]) -> int:
                     "or --preset (e.g. --preset offline), or run interactively.",
                     file=sys.stderr,
                 )
+                if available.get("agy"):
+                    print(f"note: {AGY_OPT_IN_NOTE}.", file=sys.stderr)
                 return 2
         kwargs = {
             "agents": agents,
@@ -1172,6 +1217,27 @@ def _run_init(rest: list[str]) -> int:
     configtrust.record_trust(out_path, configtrust.content_digest(out_path.read_bytes()))
     chosen = ", ".join(a["name"] for a in config["agent"])
     print(f"Wrote {out_path} — panel: {chosen} · rounds: {config['jury']['rounds']}")
+    # Seated by name only, so the operator chose it — say what they chose.
+    if any(a["name"] in OPT_IN_AGENTS for a in config["agent"]):
+        print(
+            "warning: agy cannot be confined (it reads, writes and reaches the network "
+            "even with --sandbox); do not use it on untrusted diffs. A review run warns "
+            "about this seat, and `--strict` fails on it.",
+            file=sys.stderr,
+        )
+    # A local seat whose server does not list its model is still a valid config,
+    # so it is written — but said now, not discovered by the first review as an
+    # `HTTP 404` (#849). `--list-models` already knew; init never asked. The
+    # doctor's own diagnosis is reused so the two cannot disagree about a seat.
+    from types import SimpleNamespace
+
+    from .doctor import _local_model_gap
+
+    for agent in config["agent"]:
+        fields = ("name", "vendor", "adapter", "endpoint", "model")
+        gap = _local_model_gap(SimpleNamespace(**{k: agent.get(k) for k in fields}))
+        if gap:
+            print(f"warning: agent '{agent['name']}': {gap[1]}", file=sys.stderr)
     print(f"Next: jury --config-validate --config {out_path}")
     print("Then: git diff main... | jury --diff-file -")
     return 0
@@ -1301,7 +1367,11 @@ def _run_agent_parser() -> argparse.ArgumentParser:
         f"{'/'.join(sorted(runagent.WRITE_ROLES))} need --allow-write",
     )
     sub.add_argument("--prompt-file", help="path to the prompt to send, or '-' for stdin")
-    sub.add_argument("--cwd", help="directory to run the agent in (default: the current one)")
+    sub.add_argument(
+        "--cwd",
+        help="directory a write role (implement/fix) runs in (default: the current one); "
+        "read-only roles on claude/codex/agy start in an empty temporary directory",
+    )
     sub.add_argument(
         "--timeout",
         type=int,
@@ -1520,6 +1590,14 @@ def _run_run_agent(rest: list[str], spawn=None, sleep=None, clock=None) -> int:
     if ns.cwd and not Path(ns.cwd).is_dir():
         print(f"error: --cwd is not a directory: {ns.cwd}", file=sys.stderr)
         return 2
+    if ns.cwd and not policy.write:
+        # Said, not silently dropped: a read-only role on a native CLI starts in an
+        # empty directory, so a checkout's project settings cannot reach it.
+        print(
+            f"note: --cwd applies to write roles; the read-only role '{policy.role}' "
+            f"starts in an empty temporary directory (claude/codex/agy).",
+            file=sys.stderr,
+        )
 
     try:
         config = load_config(ns.config)
@@ -1957,6 +2035,12 @@ def _maybe_add_local_fallback(config, args, log) -> None:
     )
     config.chair = "local"
     log(f"no agent CLIs found; using local model '{model}' (offline, $0)")
+    # An agy-only machine lands here too: say why its one CLI sat out.
+    from .config import agy_opt_in_hint
+
+    hint = agy_opt_in_hint((s.adapter_key for s in config.agents), shutil.which)
+    if hint:
+        log(f"note: {hint}")
 
 
 def _force_utf8_output() -> None:
@@ -2687,6 +2771,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     if collapsed:
         log(collapsed)
+        # A runner with claude + agy and no codex lands here since agy left the
+        # default panel: name the second vendor it already has, and why it sat out.
+        from .config import agy_opt_in_hint
+
+        hint = agy_opt_in_hint((s.adapter_key for s in config.agents), shutil.which)
+        if hint:
+            log(f"note: {hint}; or install another vendor's CLI, or lower --min-vendors")
+        ci_exit = 3
+    # No seat returned anything (#849). One local seat pointed at a model its
+    # server does not have failed every call with `HTTP 404`, and the run still
+    # exited 0 with a report of nothing. The collapse guard above is scoped to
+    # runs that claimed cross-vendor consensus and `min_reviews` is off by default,
+    # so neither saw it. This is narrower than both on purpose: not "too few
+    # reviews" — a seat that answered "looks good" is an abstention, and a clean
+    # single-seat run must stay green — but "every seat failed to return a result
+    # at all". A run that reviewed nothing is not a pass.
+    ran = metadata.get("panel") or {}
+    configured_seats = int(ran.get("configured") or 0)
+    if configured_seats and int(ran.get("failed") or 0) == configured_seats:
+        log(
+            f"no reviewer returned a result: all {configured_seats} seat(s) failed, so "
+            f"nothing was reviewed. A run with no review is not a pass — see each "
+            f"seat's error above, and `jury --doctor` (e.g. a local model not pulled)."
+        )
         ci_exit = 3
     # The other half of the #699 gate. The orchestrator refuses a bench that is
     # too small before spending it; this catches the two cases a pre-flight
@@ -2790,11 +2898,48 @@ def main(argv: list[str] | None = None) -> int:
         # machine-readable document must still go to stdout.
         print(report)
 
+    # The read side of `gh` has been guarded since #836; the write side was not (#844).
+    # By the time control reaches here the panel has run and the verdict is already on
+    # stdout, so a `gh` failure — missing CLI, bad token, no write permission, a deleted
+    # PR, a timeout, a refused spawn — must not replace a finished review with a traceback
+    # and exit 1. The two kinds are deliberately different:
+    #
+    #   * `--post-summary` is a contract. Asking for the verdict to be posted and not
+    #     posting it is a failure of the run, so it exits 2 like every other user error.
+    #   * `--post-inline` and `--label` are additions to a review that has already been
+    #     delivered. They report the failure and leave `ci_exit` — the gate's own answer
+    #     about the code — intact, because losing it would turn "the code is fine, GitHub
+    #     hiccuped" into "the gate failed".
+    def _post(action: str, call, *, contractual: bool) -> bool:
+        """Run *call*, reporting a `gh` failure instead of letting it escape.
+
+        Returns **whether the post landed**, so no caller can log a success that
+        did not happen. An earlier version returned `2 if contractual else None`,
+        which made failure and success indistinguishable for the non-contractual
+        callers — both were `None` — and `--post-inline` printed the error and the
+        "posted inline comments" line one after the other.
+        """
+        try:
+            call()
+        except RuntimeError as exc:
+            # `contractual` is the severity: failing a promise is an error, failing
+            # an addition to a verdict that did land is a warning. Printing both as
+            # `error:` while exiting 0 told the reader the opposite of the exit code.
+            prefix = "error" if contractual else "warning"
+            print(f"{prefix}: could not {action}: {redact(str(exc))[0]}", file=sys.stderr)
+            return False
+        return True
+
     if args.post_summary:
         if args.issue:
             # Plain issues use `gh issue comment`; phased/SHA-marker posting is
             # PR-only, so the issue path posts the single rendered report.
-            post_issue_comment(args.issue, report, args.repo)
+            if not _post(
+                f"post the verdict to issue #{args.issue}",
+                lambda: post_issue_comment(args.issue, report, args.repo),
+                contractual=True,
+            ):
+                return 2
             log(f"posted verdict to issue #{args.issue}")
             return ci_exit
         if not args.pr:
@@ -2804,7 +2949,24 @@ def main(argv: list[str] | None = None) -> int:
         from .github import pr_head_sha
         from .incremental import reviewed_sha_marker
 
-        marker_sha = head_sha or pr_head_sha(args.pr, args.repo)
+        # A missing marker costs a later `--incremental` run its narrowing; it is not
+        # worth refusing to post the verdict over, so this one degrades rather than exits.
+        # `pr_head_sha` is best-effort: it catches its own `gh` failure and returns
+        # "". An earlier version of this guard wrapped it in `try/except RuntimeError`,
+        # which is unreachable — the warning it promised could never print, and the
+        # test only passed because it mocked `pr_head_sha` itself rather than the `gh`
+        # call underneath. The empty string is the failure signal, so that is what is
+        # checked.
+        if head_sha:
+            marker_sha = head_sha
+        else:
+            marker_sha = pr_head_sha(args.pr, args.repo)
+            if not marker_sha:
+                print(
+                    "warning: could not read the PR head sha, so this review will not "
+                    "carry an incremental marker",
+                    file=sys.stderr,
+                )
         marker = f"\n\n{reviewed_sha_marker(marker_sha)}" if marker_sha else ""
 
         if args.post_mode == "phased":
@@ -2825,17 +2987,35 @@ def main(argv: list[str] | None = None) -> int:
             )
             for i, (title, body) in enumerate(sections):
                 tail = marker if i == len(sections) - 1 else ""
-                post_pr_comment(args.pr, f"## {title}\n\n{body}{tail}", args.repo)
+                if not _post(
+                    f"post phased comment {i + 1} of {len(sections)} to PR #{args.pr}",
+                    lambda t=title, b=body, x=tail: post_pr_comment(
+                        args.pr, f"## {t}\n\n{b}{x}", args.repo
+                    ),
+                    contractual=True,
+                ):
+                    return 2
             log(f"posted {len(sections)} phased comments to PR #{args.pr}")
         else:
-            post_pr_comment(args.pr, f"{report}{marker}", args.repo)
+            if not _post(
+                f"post the verdict to PR #{args.pr}",
+                lambda: post_pr_comment(args.pr, f"{report}{marker}", args.repo),
+                contractual=True,
+            ):
+                return 2
             log(f"posted verdict to PR #{args.pr}")
 
     if args.post_inline:
         if not args.pr:
             raise SystemExit("error: --post-inline requires --pr")
-        post_inline_comments(args.pr, outcome.findings, repo=args.repo, dry_run=args.dry_run)
-        log(f"posted inline comments to PR #{args.pr}")
+        if _post(
+            f"post inline comments to PR #{args.pr}",
+            lambda: post_inline_comments(
+                args.pr, outcome.findings, repo=args.repo, dry_run=args.dry_run
+            ),
+            contractual=False,
+        ):
+            log(f"posted inline comments to PR #{args.pr}")
 
     # Optional GitHub labels (issue #7): OFF by default. Only applied when
     # --label is passed AND a --pr target exists; never automatic.
@@ -2843,8 +3023,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.pr:
             raise SystemExit("error: --label requires --pr")
         labels = label_strings(classify(outcome))
-        apply_labels(args.pr, labels, args.repo)
-        log(f"applied labels to PR #{args.pr}: {', '.join(labels)}")
+        if _post(
+            f"apply labels to PR #{args.pr}",
+            lambda: apply_labels(args.pr, labels, args.repo),
+            contractual=False,
+        ):
+            log(f"applied labels to PR #{args.pr}: {', '.join(labels)}")
 
     return ci_exit
 

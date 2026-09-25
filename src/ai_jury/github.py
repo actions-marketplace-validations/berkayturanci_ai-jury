@@ -29,12 +29,35 @@ _GH_TIMEOUT_S = 90
 # full stderr pipe can't deadlock the stdout read.
 _GH_MAX_OUTPUT_BYTES = 64 * 1024 * 1024  # 64 MiB
 
+# Spawning `gh` can fail before the process exists, and the `shutil.which` guard that opens
+# each of the two callers below narrows that without closing it: the binary can be removed
+# or unmounted between the check and the spawn, and a machine already short of memory or
+# process slots refuses the fork outright (`ENOMEM`, `EAGAIN`) however present `gh` is.
+#
+# Every other failure in this module — missing CLI, timeout, non-zero exit, output over the
+# cap — leaves as a `RuntimeError`, and on the path that reads the diff `cli.py` catches
+# exactly that and prints `error: …` with exit 2 (the handler #836 added around
+# `_read_diff`). An `OSError` is not a `RuntimeError`, so it escaped that handler and
+# reached the user as a traceback. `TimeoutExpired` is the only `SubprocessError` these
+# calls raise and it is caught where it happens, so `OSError` is the whole remaining gap.
+#
+# The handler is specific to reading the diff: the post-review block that comments, posts
+# inline findings and applies labels has no such guard, so a `gh` failure there still
+# surfaces as a traceback — for every failure kind, not only this one. That is a separate
+# defect, tracked on its own rather than widened into this change.
+_GH_SPAWN_FAILED = "gh {label} could not be started: {detail}"
+
 
 def _gh(*args: str) -> str:
     if shutil.which("gh") is None:
         raise RuntimeError("the GitHub CLI `gh` is not installed or not on PATH")
     label = redact(" ".join(args))[0]
-    proc = subprocess.Popen(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise RuntimeError(
+            _GH_SPAWN_FAILED.format(label=label, detail=redact(str(exc))[0])
+        ) from None
     holder: dict[str, bytes] = {}
 
     def _drain(stream, key: str) -> None:
@@ -366,6 +389,10 @@ def _gh_with_input(args: list[str], stdin_data: str) -> str:
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"gh {redact(' '.join(args))[0]} timed out after {_GH_TIMEOUT_S}s"
+        ) from None
+    except OSError as exc:
+        raise RuntimeError(
+            _GH_SPAWN_FAILED.format(label=redact(" ".join(args))[0], detail=redact(str(exc))[0])
         ) from None
     if proc.returncode != 0:
         err = proc.stderr.strip()

@@ -168,7 +168,7 @@ class HelpSnapshotTests(unittest.TestCase):
         self.assertEqual(_render_help(), _render_help())
 
     def test_help_lists_every_documented_flag(self):
-        # Version-independent: argparse formatting varies across 3.11-3.13, but
+        # Version-independent: argparse formatting varies across Python versions, but
         # every public flag must always appear somewhere in the help output.
         help_text = _render_help()
         for flag in DOCUMENTED_FLAGS:
@@ -256,13 +256,15 @@ class ErrorContractTests(unittest.TestCase):
         self.assertIn("--pr", code)
         self.assertIn("--commit", code)
 
-    def test_no_input_source(self):
-        code, _, _ = _run_cli(["--mock"], stdin="")
-        self.assertEqual(
-            code,
-            "error: provide one of --pr, --issue, --diff-file, --commit, --commits "
-            "(or --diff-file - for stdin)",
-        )
+    def test_no_input_source_under_mock_runs_the_bundled_demo(self):
+        # Contract change (#21): `jury --mock` with no diff source is the offline
+        # demo — it reviews a diff bundled with the package rather than erroring.
+        # The no-source error is now reserved for real (non-mock) runs, and is
+        # locked by test_offline_demo / test_commit_sources at the unit level.
+        code, out, err = _run_cli(["--mock"], stdin="")
+        self.assertEqual(code, 0)
+        self.assertIn("AI Jury", out)
+        self.assertIn("bundled offline-demo diff", err)
 
     def test_empty_diff(self):
         code, _, _ = _run_cli(["--mock", "--diff-file", "-"], stdin="")
